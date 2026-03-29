@@ -3,7 +3,7 @@ Persona presets — borrowed and adapted from MAGI's preset concept.
 
 Each preset is a list of (name, system_prompt) tuples.
 Usage:
-    from openparty.presets import get_preset
+    from src.presets import get_preset
     personas = get_preset("code-review")
     # personas[0] = ("Architect", "You are a system architect...")
 """

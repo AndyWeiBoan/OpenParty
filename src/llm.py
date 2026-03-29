@@ -9,7 +9,7 @@ Supports any endpoint that speaks the OpenAI Chat Completions API:
   - OpenAI          (default, no base_url needed)
 
 Usage:
-    from openparty.llm import make_llm_fn
+    from src.llm import make_llm_fn
 
     llm = make_llm_fn(
         model="qwen3-coder:30b",

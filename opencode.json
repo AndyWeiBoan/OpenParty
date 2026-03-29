@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "openparty": {
+      "type": "local",
+      "command": [
+        "/Users/andywei/OpenParty/.venv/bin/python",
+        "/Users/andywei/OpenParty/mcp/openparty_mcp.py"
+      ],
+      "enabled": true
+    }
+  }
+}
