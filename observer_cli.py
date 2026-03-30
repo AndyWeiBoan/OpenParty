@@ -12,6 +12,7 @@ import json
 import argparse
 import locale
 import re
+import signal
 import sys
 import unicodedata
 from datetime import datetime
@@ -171,6 +172,7 @@ class ChatUI:
         self.room_id = room_id
         self.name = name
         self.input_buf = ""
+        self.input_cursor = 0  # character index into input_buf
         self.lines: list[tuple[str, int]] = []  # (text, color_pair)
         self.available_engines: list[str] = []  # filled from server "joined" msg
 
@@ -183,7 +185,9 @@ class ChatUI:
 
         # Generic picker state ("" = closed, "model" = /add-agent, "kick" = /kick)
         self.picker_mode: str = ""
-        self.picker_items: list[dict] = []
+        self.picker_items: list[dict] = []      # currently visible (filtered) items
+        self.picker_all_items: list[dict] = []  # full unfiltered list
+        self.picker_search: str = ""            # search query (model mode only)
         self.picker_idx = 0
         self.model_win: Optional[curses.window] = None
 
@@ -233,6 +237,47 @@ class ChatUI:
             | curses.BUTTON1_CLICKED # left click (scrollbar jump)
             | curses.REPORT_MOUSE_POSITION
         )
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+
+    def _filter_picker(self):
+        """Recompute picker_items from picker_all_items based on picker_search."""
+        q = self.picker_search.lower()
+        if q:
+            self.picker_items = [
+                item for item in self.picker_all_items
+                if q in item.get("display", "").lower()
+            ]
+        else:
+            self.picker_items = list(self.picker_all_items)
+        self.picker_idx = 0
+
+    def resize(self):
+        """Recreate all sub-windows after terminal resize or focus restore."""
+        try:
+            curses.update_lines_cols()
+        except AttributeError:
+            pass
+        h, w = self.stdscr.getmaxyx()
+        try:
+            curses.resizeterm(h, w)
+        except Exception:
+            pass
+        # Discard stale popup windows
+        self.completion_win = None
+        self.model_win = None
+        # Rebuild main windows at new dimensions
+        self.chat_win  = curses.newwin(max(1, h - 2), max(1, w), 0, 0)
+        self.sep_win   = curses.newwin(1, max(1, w), max(0, h - 2), 0)
+        self.input_win = curses.newwin(1, max(1, w), max(0, h - 1), 0)
+        self.chat_h = max(1, h - 2)
+        self.chat_w = max(1, w)
+        self.term_h = h
+        # Force full physical repaint (covers screen corruption on window switch)
+        self.stdscr.clearok(True)
+        self.render()
 
     def _redraw_sep(self):
         self.sep_win.clear()
@@ -247,12 +292,33 @@ class ChatUI:
     def _redraw_input(self):
         self.input_win.clear()
         prompt = "> "
-        display = prompt + self.input_buf
+        prompt_w = 2
         max_w = self.chat_w - 1
-        if display_width(display) > max_w:
-            display = truncate_to_display_width(display, max_w)
+        content_w = max_w - prompt_w
+
+        before_cursor = self.input_buf[:self.input_cursor]
+        after_cursor = self.input_buf[self.input_cursor:]
+        before_w = display_width(before_cursor)
+
+        if before_w <= content_w:
+            # Cursor is within view: show from beginning, truncate tail
+            visible_text = truncate_head(self.input_buf, content_w)
+            cursor_x = prompt_w + before_w
+        else:
+            # Text before cursor overflows: scroll so cursor stays near right edge
+            visible_before = truncate_to_display_width(before_cursor, content_w - 1)
+            visible_before_w = display_width(visible_before)
+            cursor_x = prompt_w + visible_before_w
+            avail_after = max_w - cursor_x
+            visible_after = truncate_head(after_cursor, avail_after)
+            visible_text = visible_before + visible_after
+
         try:
-            self.input_win.addstr(0, 0, display)
+            self.input_win.addstr(0, 0, prompt + visible_text)
+        except curses.error:
+            pass
+        try:
+            self.input_win.move(0, min(cursor_x, self.chat_w - 1))
         except curses.error:
             pass
         self.input_win.noutrefresh()
@@ -367,24 +433,37 @@ class ChatUI:
             self.model_win = None
             self._restore_base_windows()
 
-        if not self.picker_mode or not self.picker_items:
+        if not self.picker_mode:
+            return
+        # model mode needs at least picker_all_items; kick mode needs picker_items
+        if self.picker_mode == "model" and not self.picker_all_items:
+            return
+        if self.picker_mode != "model" and not self.picker_items:
             return
 
-        visible = min(10, len(self.picker_items))
-        popup_h = visible + 3
-        popup_w = min(self.chat_w - 4, 60)
+        has_search = self.picker_mode == "model"
+        items = self.picker_items
+
+        visible = min(10, len(items))
+        # +1 for search box row (model mode only)
+        extra = 1 if has_search else 0
+        popup_h = max(visible, 1) + 3 + extra
+        popup_w = min(self.chat_w - 4, 66)
         popup_y = max(0, self.term_h - 2 - popup_h)
         popup_x = 2
 
         # scroll window so selected item is visible
         start = max(0, self.picker_idx - visible + 1)
-        shown = self.picker_items[start:start + visible]
+        shown = items[start:start + visible]
 
         if self.picker_mode == "kick":
-            title = " 選擇踢除成員 (↑↓ 移動, Enter 確認, Esc 取消) "
+            title = " 選擇踢除成員 (↑↓ Enter Esc) "
         else:
-            title = " 選擇 Agent (↑↓ 移動, Enter 確認, Esc 取消) "
+            match_info = f"{len(items)}/{len(self.picker_all_items)}"
+            title = f" 選擇 Agent [{match_info}]  ↑↓ Enter Esc "
         title = title[:popup_w - 2]
+
+        item_row_start = 1 + extra  # row where list items begin
 
         try:
             win = curses.newwin(popup_h, popup_w, popup_y, popup_x)
@@ -394,15 +473,32 @@ class ChatUI:
                 win.addstr(0, 1, title, curses.color_pair(PAIR_CYAN) | curses.A_BOLD)
             except curses.error:
                 pass
-            for row, item in enumerate(shown):
-                label = f" {item['display']}"[:popup_w - 2]
-                idx = start + row
-                pair = curses.color_pair(PAIR_CYAN) | curses.A_BOLD if idx == self.picker_idx \
-                       else curses.color_pair(PAIR_INPUT_BAR)
+
+            if has_search:
+                # Search box at row 1
+                cursor_marker = "\u258f" if len(self.picker_search) < popup_w - 6 else ""
+                search_line = f" / {self.picker_search}{cursor_marker}"[:popup_w - 2]
                 try:
-                    win.addstr(row + 1, 1, label, pair)
+                    win.addstr(1, 1, search_line, curses.color_pair(PAIR_INPUT_BAR) | curses.A_BOLD)
                 except curses.error:
                     pass
+
+            if not items:
+                try:
+                    win.addstr(item_row_start, 1, " (no results)", curses.color_pair(PAIR_DIM))
+                except curses.error:
+                    pass
+            else:
+                for row, item in enumerate(shown):
+                    label = f" {item['display']}"[:popup_w - 2]
+                    idx = start + row
+                    pair = curses.color_pair(PAIR_CYAN) | curses.A_BOLD if idx == self.picker_idx \
+                           else curses.color_pair(PAIR_INPUT_BAR)
+                    try:
+                        win.addstr(item_row_start + row, 1, label, pair)
+                    except curses.error:
+                        pass
+
             win.noutrefresh()
             self.model_win = win
         except curses.error:
@@ -578,17 +674,17 @@ async def fetch_models(available_engines: list[str]) -> list[dict]:
             connected = set(data.get("connected", []))
             for provider in data.get("all", []):
                 pid = provider.get("id", "")
-                if pid != "opencode" or pid not in connected:
+                if pid not in connected:
                     continue
                 models = provider.get("models", {})
                 items = models.values() if isinstance(models, dict) else models
                 for m in items:
                     mid = m.get("id", "")
                     mname = m.get("name", mid)
-                    base_name = mid.split("/")[-1] if mid else "agent"
+                    base_name = mid.split("/")[-1].split(":")[0] if mid else "agent"
                     result.append({
-                        "display": f"opencode - {mname}",
-                        "full_id": f"opencode/{mid}",
+                        "display": f"{pid} - {mname}",
+                        "full_id": f"{pid}/{mid}",
                         "engine": "opencode",
                         "base_name": base_name[:12],
                     })
@@ -660,9 +756,28 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
     curses.cbreak()
     stdscr.keypad(True)
 
+    # SIGWINCH fires on terminal resize and, on some macOS terminals, on
+    # focus restore — both cases should trigger a full window rebuild.
+    _resize_needed = False
+
+    def _on_sigwinch():
+        nonlocal _resize_needed
+        _resize_needed = True
+
+    loop = asyncio.get_event_loop()
+    try:
+        loop.add_signal_handler(signal.SIGWINCH, _on_sigwinch)
+    except (OSError, NotImplementedError):
+        pass  # Windows or environments without SIGWINCH
+
     ui.render()
 
     while True:
+        # Handle deferred resize / focus-restore repaint
+        if _resize_needed:
+            _resize_needed = False
+            ui.resize()
+
         # Process all pending server messages
         while not message_queue.empty():
             msg = await message_queue.get()
@@ -676,6 +791,11 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
             pass
 
         if ch is not None:
+            # ── Terminal resize ──────────────────────────────────────────────
+            if ch == curses.KEY_RESIZE:
+                ui.resize()
+                continue
+
             # ── Scroll keys (always active) ─────────────────────────────────
             if ch == curses.KEY_PPAGE:  # Page Up
                 ui.scroll_offset += ui.chat_h // 2
@@ -729,40 +849,55 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                     ui.picker_idx = max(0, ui.picker_idx - 1)
                     ui.render()
                 elif ch in (curses.KEY_DOWN,):
-                    ui.picker_idx = min(len(ui.picker_items) - 1, ui.picker_idx + 1)
+                    ui.picker_idx = min(max(0, len(ui.picker_items) - 1), ui.picker_idx + 1)
                     ui.render()
                 elif ch in (curses.KEY_ENTER, '\n', '\r'):
-                    item = ui.picker_items[ui.picker_idx]
-                    mode = ui.picker_mode
-                    ui.picker_mode = ""
-                    ui.picker_items = []
-                    ui.picker_idx = 0
-                    if mode == "model":
-                        base = item.get("base_name", item["full_id"].split("/")[-1])[:12]
-                        existing_names = {a["name"] for a in ui.agents}
-                        if base not in existing_names:
-                            agent_name = base
-                        else:
-                            n = 2
-                            while f"{base}-{n}" in existing_names:
-                                n += 1
-                            agent_name = f"{base}-{n}"
-                        ui.add_line(
-                            f"{now()}  [spawning] {item['display']} as '{agent_name}'...",
-                            PAIR_GREEN,
-                        )
-                        ui.render()
-                        await spawn_agent(ws, agent_name, item["full_id"], item.get("engine", "opencode"))
-                    elif mode == "kick":
-                        await ws.send(json.dumps({
-                            "type": "kick_agent",
-                            "agent_name": item["agent_name"],
-                        }))
-                        ui.render()
+                    if not ui.picker_items:
+                        pass  # no results — ignore Enter
+                    else:
+                        item = ui.picker_items[ui.picker_idx]
+                        mode = ui.picker_mode
+                        ui.picker_mode = ""
+                        ui.picker_items = []
+                        ui.picker_all_items = []
+                        ui.picker_search = ""
+                        ui.picker_idx = 0
+                        if mode == "model":
+                            base = item.get("base_name", item["full_id"].split("/")[-1])[:12]
+                            existing_names = {a["name"] for a in ui.agents}
+                            if base not in existing_names:
+                                agent_name = base
+                            else:
+                                n = 2
+                                while f"{base}-{n}" in existing_names:
+                                    n += 1
+                                agent_name = f"{base}-{n}"
+                            ui.add_line(
+                                f"{now()}  [spawning] {item['display']} as '{agent_name}'...",
+                                PAIR_GREEN,
+                            )
+                            ui.render()
+                            await spawn_agent(ws, agent_name, item["full_id"], item.get("engine", "opencode"))
+                        elif mode == "kick":
+                            await ws.send(json.dumps({
+                                "type": "kick_agent",
+                                "agent_name": item["agent_name"],
+                            }))
+                            ui.render()
                 elif ch in ('\x1b',) or ch == 27:  # Esc
                     ui.picker_mode = ""
                     ui.picker_items = []
+                    ui.picker_all_items = []
+                    ui.picker_search = ""
                     ui.picker_idx = 0
+                    ui.render()
+                elif ui.picker_mode == "model" and ch in (curses.KEY_BACKSPACE, '\x7f', '\x08', 127, 8):
+                    ui.picker_search = ui.picker_search[:-1]
+                    ui._filter_picker()
+                    ui.render()
+                elif ui.picker_mode == "model" and isinstance(ch, str) and ord(ch) >= 32:
+                    ui.picker_search += ch
+                    ui._filter_picker()
                     ui.render()
                 continue
 
@@ -783,6 +918,7 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                     if ui.completing_type == "mention":
                         # Replace only the trailing @partial in input_buf
                         ui.input_buf = re.sub(r"@[\w\-]*$", selected + " ", ui.input_buf)
+                        ui.input_cursor = len(ui.input_buf)
                         ui.completing = False
                         ui.completion_items = []
                         _update_completion(ui)
@@ -791,6 +927,7 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                     else:
                         # Command: fill input; Enter also falls through to execute
                         ui.input_buf = selected
+                        ui.input_cursor = len(ui.input_buf)
                         ui.completing = False
                         ui.completion_items = []
                         if ch in ('\t',):
@@ -807,6 +944,7 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
             if ch in (curses.KEY_ENTER, '\n', '\r'):
                 text = ui.input_buf.strip()
                 ui.input_buf = ""
+                ui.input_cursor = 0
                 ui.completing = False
                 ui.completion_items = []
 
@@ -823,7 +961,9 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                             PAIR_RED,
                         )
                     else:
-                        ui.picker_items = models
+                        ui.picker_all_items = list(models)
+                        ui.picker_items = list(models)
+                        ui.picker_search = ""
                         ui.picker_idx = 0
                         ui.picker_mode = "model"
                     ui.render()
@@ -831,7 +971,11 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                     if not ui.agents:
                         ui.add_line(f"{now()}  [system] 目前沒有成員可踢除", PAIR_YELLOW)
                     else:
-                        await ws.send(json.dumps({"type": "kick_all"}))
+                        for agent in list(ui.agents):
+                            await ws.send(json.dumps({
+                                "type": "kick_agent",
+                                "agent_name": agent["name"],
+                            }))
                 elif text == "/kick":
                     if not ui.agents:
                         ui.add_line(f"{now()}  [system] 目前沒有成員可踢除", PAIR_YELLOW)
@@ -847,13 +991,38 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                     await ws.send(json.dumps({"type": "message", "content": text}))
                 ui.render()
 
-            elif ch in (curses.KEY_BACKSPACE, '\x7f', '\x08', 127, 8):
-                ui.input_buf = ui.input_buf[:-1]
-                _update_completion(ui)
+            elif ch == curses.KEY_LEFT:
+                ui.input_cursor = max(0, ui.input_cursor - 1)
                 ui.render()
 
+            elif ch == curses.KEY_RIGHT:
+                ui.input_cursor = min(len(ui.input_buf), ui.input_cursor + 1)
+                ui.render()
+
+            elif ch == curses.KEY_HOME or ch == '\x01':  # Home / Ctrl+A
+                ui.input_cursor = 0
+                ui.render()
+
+            elif ch == '\x05':  # Ctrl+E → end of line
+                ui.input_cursor = len(ui.input_buf)
+                ui.render()
+
+            elif ch == curses.KEY_DC:  # Delete key → delete char at cursor
+                if ui.input_cursor < len(ui.input_buf):
+                    ui.input_buf = ui.input_buf[:ui.input_cursor] + ui.input_buf[ui.input_cursor + 1:]
+                    _update_completion(ui)
+                    ui.render()
+
+            elif ch in (curses.KEY_BACKSPACE, '\x7f', '\x08', 127, 8):
+                if ui.input_cursor > 0:
+                    ui.input_buf = ui.input_buf[:ui.input_cursor - 1] + ui.input_buf[ui.input_cursor:]
+                    ui.input_cursor -= 1
+                    _update_completion(ui)
+                    ui.render()
+
             elif isinstance(ch, str) and ord(ch) >= 32:
-                ui.input_buf += ch
+                ui.input_buf = ui.input_buf[:ui.input_cursor] + ch + ui.input_buf[ui.input_cursor:]
+                ui.input_cursor += 1
                 _update_completion(ui)
                 ui.render()
 
