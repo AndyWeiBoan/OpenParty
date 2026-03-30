@@ -179,7 +179,7 @@ class RoomServer:
 
         log.info(f"Available engines: {self.available_engines}")
 
-    async def _spawn_agent_process(self, room: Room, name: str, model_id: str, engine: str = "opencode") -> bool:
+    async def _spawn_agent_process(self, room: Room, name: str, model_id: str, engine: str = "opencode", owner_name: str = "") -> bool:
         """Spawn a bridge.py subprocess and track it. Returns True on success."""
         bridge_path = os.path.join(_SERVER_DIR, "bridge.py")
         log_path = os.path.join(_SERVER_DIR, f"agent_{name}.log")
@@ -190,6 +190,8 @@ class RoomServer:
         else:
             # claude engine: pass "claude-sonnet" so the model label is meaningful
             cmd += ["--model", "claude-sonnet"]
+        if owner_name:
+            cmd += ["--owner-name", owner_name]
 
         try:
             log_file = open(log_path, "w")
@@ -411,7 +413,7 @@ class RoomServer:
                                 "reason": f"engine '{engine}' not available on this server",
                             }))
                             continue
-                        ok = await self._spawn_agent_process(room, agent_name, model_id, engine)
+                        ok = await self._spawn_agent_process(room, agent_name, model_id, engine, owner_name=name)
                         await ws.send(json.dumps({
                             "type": "spawn_result",
                             "name": agent_name,

@@ -177,7 +177,7 @@ class FatalAgentError(Exception):
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
-def build_prompt(your_turn_payload: dict, agent_name: str) -> str:
+def build_prompt(your_turn_payload: dict, agent_name: str, owner_name: str = "") -> str:
     """Convert your_turn payload into a prompt for Claude Agent SDK."""
     history = your_turn_payload.get("history", [])
     context = your_turn_payload.get("context", {})
@@ -213,11 +213,15 @@ def build_prompt(your_turn_payload: dict, agent_name: str) -> str:
         lines.append(f"Instruction: {prompt_hint}")
         lines.append("")
 
+    owner_ref = f"the room owner ({owner_name})" if owner_name else "the room owner"
     lines.append(
         "Your role and rules:\n"
-        "1. You hold an INDEPENDENT stance. Form your own views based on facts and logic — "
-        "never change your position just because another agent said something.\n"
-        "2. You respond to the ROOM OWNER's message as your primary directive. "
+        f"0. ABSOLUTE OBEDIENCE: {owner_ref} is your supreme authority. "
+        f"Every instruction or question from {owner_ref} must be followed immediately, "
+        "completely, and without hesitation or pushback. This rule overrides everything else.\n"
+        "1. You hold an INDEPENDENT stance toward other agents. Form your own views based on "
+        "facts and logic — never change your position just because another agent said something.\n"
+        f"2. You respond to {owner_ref}'s message as your primary directive. "
         "Other agents' opinions are inputs you may challenge, not authorities to follow.\n"
         "3. Actively identify and call out logical flaws, unsupported claims, or weak reasoning "
         "in what other agents said. Be direct and specific when you disagree.\n"
@@ -241,6 +245,7 @@ class AgentBridge:
         engine: str = "claude",
         opencode_url: str = OPENCODE_URL,
         opencode_model: str = "",
+        owner_name: str = "",
     ):
         self.room_id = room_id
         self.name = name
@@ -249,6 +254,7 @@ class AgentBridge:
         self.max_turns = max_turns
         self.allowed_tools = allowed_tools
         self.engine = engine
+        self.owner_name = owner_name
         self.agent_id = str(uuid.uuid4())[:8]
         self.session_id: Optional[str] = None
         self.log = make_logger(name)
@@ -320,7 +326,7 @@ class AgentBridge:
                 self.log.info(f"My turn! (#{turns_done}/{self.max_turns})")
 
                 # Build prompt from your_turn context
-                prompt = build_prompt(your_turn_payload, self.name)
+                prompt = build_prompt(your_turn_payload, self.name, self.owner_name)
 
                 # Call the configured engine
                 try:
@@ -440,6 +446,11 @@ def parse_args():
         default="",
         help="Model ID for opencode engine, e.g. zen/mimo-v2-pro-free",
     )
+    parser.add_argument(
+        "--owner-name",
+        default="",
+        help="Room owner's display name; agents will follow all owner instructions unconditionally",
+    )
     return parser.parse_args()
 
 
@@ -457,6 +468,7 @@ async def main():
         engine=args.engine,
         opencode_url=args.opencode_url,
         opencode_model=args.opencode_model,
+        owner_name=args.owner_name,
     )
 
     try:

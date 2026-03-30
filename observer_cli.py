@@ -1050,7 +1050,8 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 async def observe(stdscr, room_id: str, server_url: str, name: str, owner: bool):
-    ui = ChatUI(stdscr, owner=owner, room_id=room_id, name=name)
+    display_name = f"[owner] {name}" if owner else name
+    ui = ChatUI(stdscr, owner=owner, room_id=room_id, name=display_name)
 
     try:
         async with websockets.connect(server_url) as ws:
@@ -1058,7 +1059,7 @@ async def observe(stdscr, room_id: str, server_url: str, name: str, owner: bool)
                 "type": "join",
                 "role": "observer",
                 "room_id": room_id,
-                "name": name,
+                "name": display_name,
                 "owner": owner,
             }))
 
