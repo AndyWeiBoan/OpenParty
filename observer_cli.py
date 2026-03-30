@@ -606,13 +606,24 @@ class ChatUI:
         name = entry.get("name", "?")
         model = entry.get("model", "")
         content = entry.get("content", "")
+        is_private = entry.get("is_private", False)
+        private_to = entry.get("private_to", [])
         pair = color_pair_for(name)
         self.add_line("", PAIR_DIM)
         model_label = _model_label(model)
         header = f"  {name}  ({model_label})" if model_label else f"  {name}"
-        self.add_line(header, pair | curses.A_BOLD)
-        for line in content.split("\n"):
-            self.add_line(f"    {line}", PAIR_DIM)
+        if is_private:
+            if private_to:
+                whisper_tag = f" 【私訊 → {', '.join(private_to)}】"
+            else:
+                whisper_tag = " 【私訊】"
+            self.add_line(header + whisper_tag, curses.color_pair(PAIR_MAGENTA) | curses.A_BOLD)
+            for line in content.split("\n"):
+                self.add_line(f"    {line}", curses.color_pair(PAIR_MAGENTA))
+        else:
+            self.add_line(header, pair | curses.A_BOLD)
+            for line in content.split("\n"):
+                self.add_line(f"    {line}", PAIR_DIM)
 
 
 MENTION_RE = re.compile(r"(@[\w][\w\-]*)")

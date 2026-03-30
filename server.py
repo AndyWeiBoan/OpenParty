@@ -19,12 +19,15 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+
+_MENTION_RE = re.compile(r"@([\w][\w\-]*)")
 
 import aiohttp
 import websockets
@@ -104,9 +107,23 @@ class Room:
     turn_pending: bool = False  # True while an agent is actively thinking
     round_speakers: set = field(default_factory=set)  # agents who spoke this round
     broadcast_pending: Optional[set] = None  # None = sequential mode; set = agent IDs yet to respond in broadcast
+    # Private message support: maps history index → set of agent_ids allowed to see that entry
+    private_visibility: dict = field(default_factory=dict)
+    # Set to the target agent_id(s) while a private turn is in progress; None otherwise
+    current_private_for: Optional[set] = None
 
-    def context_window(self) -> list[dict]:
-        return self.history[-SLIDING_WINDOW_SIZE:]
+    def context_window(self, agent_id: Optional[str] = None) -> list[dict]:
+        """Return recent history window, filtering out private entries invisible to agent_id."""
+        window = self.history[-SLIDING_WINDOW_SIZE:]
+        if agent_id is None or not self.private_visibility:
+            return window
+        start_idx = max(0, len(self.history) - SLIDING_WINDOW_SIZE)
+        return [
+            entry
+            for i, entry in enumerate(window)
+            if (start_idx + i) not in self.private_visibility
+            or agent_id in self.private_visibility[start_idx + i]
+        ]
 
     def next_speaker(self, exclude_id: str) -> Optional[Agent]:
         """Return next agent who hasn't spoken this round. None if all have spoken."""
@@ -233,12 +250,17 @@ class RoomServer:
         message: dict,
         exclude_id: Optional[str] = None,
         agents_only: bool = False,
+        observers_only: bool = False,
     ):
-        """Send message to all agents (and observers unless agents_only=True)."""
+        """Send message to all agents (and observers unless agents_only=True).
+        observers_only=True sends only to observers, skipping agents entirely."""
         payload = json.dumps(message)
-        targets = [a.ws for aid, a in room.agents.items() if aid != exclude_id]
-        if not agents_only:
-            targets += [o.ws for o in room.observers.values()]
+        if observers_only:
+            targets = list(o.ws for o in room.observers.values())
+        else:
+            targets = [a.ws for aid, a in room.agents.items() if aid != exclude_id]
+            if not agents_only:
+                targets += [o.ws for o in room.observers.values()]
         if targets:
             await asyncio.gather(
                 *[ws.send(payload) for ws in targets], return_exceptions=True
@@ -255,23 +277,24 @@ class RoomServer:
         room.turn_pending = False
         room.turn_started_at = time.monotonic()
 
-        your_turn_payload = json.dumps({
-            "type": "your_turn",
-            "broadcast": True,
-            "history": room.context_window(),
-            "summary": room.rolling_summary,
-            "context": {
-                "topic": room.topic,
-                "participants": [
-                    {"name": a.name, "model": a.model} for a in agents
-                ],
-                "total_turns": len(room.history),
-            },
-        })
+        context_base = {
+            "topic": room.topic,
+            "participants": [{"name": a.name, "model": a.model} for a in agents],
+            "total_turns": len(room.history),
+        }
 
-        # Dispatch your_turn to all agents in parallel
+        # Build per-agent payloads so private history entries are properly filtered
         await asyncio.gather(
-            *[a.ws.send(your_turn_payload) for a in agents],
+            *[
+                a.ws.send(json.dumps({
+                    "type": "your_turn",
+                    "broadcast": True,
+                    "history": room.context_window(a.agent_id),
+                    "summary": room.rolling_summary,
+                    "context": context_base,
+                }))
+                for a in agents
+            ],
             return_exceptions=True,
         )
 
@@ -296,7 +319,7 @@ class RoomServer:
 
         your_turn_payload = {
             "type": "your_turn",
-            "history": room.context_window(),
+            "history": room.context_window(agent.agent_id),
             "summary": room.rolling_summary,
             "context": {
                 "topic": room.topic,
@@ -523,6 +546,40 @@ class RoomServer:
                         "content": content,
                         "timestamp": timestamp,
                     }
+
+                    # ── Private message: @mention detected ───────────────────
+                    mentions = _MENTION_RE.findall(content)
+                    if mentions:
+                        mention_set = set(mentions)
+                        private_targets = [
+                            a for a in room.agents.values() if a.name in mention_set
+                        ]
+                        if private_targets:
+                            target = private_targets[0]
+                            hist_idx = len(room.history)
+                            room.history.append(entry)
+                            room.private_visibility[hist_idx] = {target.agent_id}
+                            room.current_private_for = {target.agent_id}
+                            room.round_speakers = set()
+                            room.broadcast_pending = None
+                            if not room.owner_kicked_off:
+                                room.owner_kicked_off = True
+                                room.topic = content
+                            log.info(
+                                f"[{room_id}] [whisper→{target.name}] {name}: {content[:80]}"
+                            )
+                            # Broadcast to observers only (other agents must not see this)
+                            await self._broadcast(room, {
+                                "type": "message",
+                                "is_private": True,
+                                "private_to": [target.name],
+                                **entry,
+                            }, observers_only=True)
+                            if not room.turn_pending:
+                                await self._send_your_turn(room, target)
+                            continue
+
+                    # ── Normal (public) message ───────────────────────────────
                     room.history.append(entry)
                     log.info(f"[{room_id}] [owner] {name}: {content[:80]}")
                     await self._broadcast(room, {"type": "message", **entry})
@@ -633,11 +690,30 @@ class RoomServer:
                         "content": content,
                         "timestamp": timestamp,
                     }
+
+                    # Check if this reply is part of a private turn
+                    is_private_reply = (
+                        room.current_private_for is not None
+                        and agent_id in room.current_private_for
+                    )
+
+                    hist_idx = len(room.history)
                     room.history.append(entry)
+                    if is_private_reply:
+                        room.private_visibility[hist_idx] = room.current_private_for.copy()
+                        room.current_private_for = None
+
                     log.info(f"[{room_id}] {name} ({latency_ms}ms): {content[:80]}...")
 
-                    # Broadcast message to agents + observers
-                    await self._broadcast(room, {"type": "message", **entry})
+                    # Private replies go only to observers; public replies go to everyone
+                    if is_private_reply:
+                        await self._broadcast(room, {
+                            "type": "message",
+                            "is_private": True,
+                            **entry,
+                        }, observers_only=True)
+                    else:
+                        await self._broadcast(room, {"type": "message", **entry})
 
                     # Emit turn_end for observers
                     await self._broadcast(
@@ -654,7 +730,16 @@ class RoomServer:
                     # Mark this agent as having spoken this round
                     room.round_speakers.add(agent_id)
 
-                    if room.broadcast_pending is not None:
+                    if is_private_reply:
+                        # ── Private round complete: return control to owner ───
+                        room.turn_pending = False
+                        room.current_speaker = None
+                        log.info(f"[{room_id}] Private round complete. Waiting for owner.")
+                        await self._broadcast(room, {
+                            "type": "waiting_for_owner",
+                            "message": "私訊回覆完成，等待下一則訊息。",
+                        })
+                    elif room.broadcast_pending is not None:
                         # ── Broadcast mode: track who's still pending ────────
                         room.broadcast_pending.discard(agent_id)
                         if not room.broadcast_pending:
@@ -726,6 +811,10 @@ class RoomServer:
                             "type": "waiting_for_owner",
                             "message": "All agents have responded. Waiting for your next message.",
                         })
+
+                # If this agent was the target of a private turn, clear the private state
+                if room.current_private_for and agent.agent_id in room.current_private_for:
+                    room.current_private_for = None
 
                 # Reassign turn if the speaker just left (sequential mode only)
                 elif room.current_speaker == agent.agent_id:
