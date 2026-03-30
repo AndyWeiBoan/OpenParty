@@ -103,6 +103,7 @@ class Room:
     owner_kicked_off: bool = False  # True after owner sends first message
     turn_pending: bool = False  # True while an agent is actively thinking
     round_speakers: set = field(default_factory=set)  # agents who spoke this round
+    broadcast_pending: Optional[set] = None  # None = sequential mode; set = agent IDs yet to respond in broadcast
 
     def context_window(self) -> list[dict]:
         return self.history[-SLIDING_WINDOW_SIZE:]
@@ -240,6 +241,50 @@ class RoomServer:
             await asyncio.gather(
                 *[ws.send(payload) for ws in targets], return_exceptions=True
             )
+
+    async def _send_broadcast_turn(self, room: Room):
+        """Send your_turn to ALL agents simultaneously (broadcast mode)."""
+        agents = list(room.agents.values())
+        if not agents:
+            return
+
+        room.broadcast_pending = {a.agent_id for a in agents}
+        room.current_speaker = None
+        room.turn_pending = False
+        room.turn_started_at = time.monotonic()
+
+        your_turn_payload = json.dumps({
+            "type": "your_turn",
+            "broadcast": True,
+            "history": room.context_window(),
+            "summary": room.rolling_summary,
+            "context": {
+                "topic": room.topic,
+                "participants": [
+                    {"name": a.name, "model": a.model} for a in agents
+                ],
+                "total_turns": len(room.history),
+            },
+        })
+
+        # Dispatch your_turn to all agents in parallel
+        await asyncio.gather(
+            *[a.ws.send(your_turn_payload) for a in agents],
+            return_exceptions=True,
+        )
+
+        # Notify observers: one turn_start per agent
+        for agent in agents:
+            await self._broadcast(room, {
+                "type": "turn_start",
+                "agent_id": agent.agent_id,
+                "name": agent.name,
+                "model": agent.model,
+                "broadcast": True,
+                "turn_number": len(room.history) + 1,
+            }, agents_only=False)
+
+        log.info(f"[{room.room_id}] broadcast → {[a.name for a in agents]}")
 
     async def _send_your_turn(self, room: Room, agent: Agent, kickoff: bool = False):
         """Send your_turn to an agent and emit turn_start to observers."""
@@ -434,6 +479,35 @@ class RoomServer:
                             }))
                         continue
 
+                    # ── broadcast: owner fires message to all agents at once ───
+                    if msg_type == "broadcast":
+                        content = owner_msg.get("content", "").strip()
+                        if not content:
+                            continue
+                        if not room.agents:
+                            await ws.send(json.dumps({
+                                "type": "system_message",
+                                "text": "目前沒有 agent 可以廣播，請先用 /add-agent 加入。",
+                            }))
+                            continue
+                        timestamp = datetime.now(timezone.utc).isoformat()
+                        entry = {
+                            "agent_id": observer_id,
+                            "name": name,
+                            "model": "human",
+                            "content": f"[broadcast] {content}",
+                            "timestamp": timestamp,
+                        }
+                        room.history.append(entry)
+                        room.round_speakers = set()
+                        if not room.owner_kicked_off:
+                            room.owner_kicked_off = True
+                            room.topic = content
+                        log.info(f"[{room_id}] [broadcast] {name}: {content[:80]}")
+                        await self._broadcast(room, {"type": "message", **entry})
+                        await self._send_broadcast_turn(room)
+                        continue
+
                     if msg_type != "message":
                         continue
                     content = owner_msg.get("content", "").strip()
@@ -451,8 +525,9 @@ class RoomServer:
                     log.info(f"[{room_id}] [owner] {name}: {content[:80]}")
                     await self._broadcast(room, {"type": "message", **entry})
 
-                    # Each owner message starts a new round
+                    # Each owner message starts a new round (also cancels any ongoing broadcast)
                     room.round_speakers = set()
+                    room.broadcast_pending = None
 
                     if not room.owner_kicked_off and len(room.agents) >= 1:
                         room.owner_kicked_off = True
@@ -576,20 +651,31 @@ class RoomServer:
 
                     # Mark this agent as having spoken this round
                     room.round_speakers.add(agent_id)
-                    room.turn_pending = False
 
-                    # Pass turn to next agent who hasn't spoken this round
-                    next_agent = room.next_speaker(exclude_id=agent_id)
-                    if next_agent:
-                        await self._send_your_turn(room, next_agent)
+                    if room.broadcast_pending is not None:
+                        # ── Broadcast mode: track who's still pending ────────
+                        room.broadcast_pending.discard(agent_id)
+                        if not room.broadcast_pending:
+                            room.broadcast_pending = None
+                            room.current_speaker = None
+                            log.info(f"[{room_id}] Broadcast round complete. Waiting for owner.")
+                            await self._broadcast(room, {
+                                "type": "waiting_for_owner",
+                                "message": "All agents have responded. Waiting for your next message.",
+                            })
                     else:
-                        # All agents have spoken this round — wait for owner's next message
-                        room.current_speaker = None
-                        log.info(f"[{room_id}] Round complete. Waiting for owner.")
-                        await self._broadcast(room, {
-                            "type": "waiting_for_owner",
-                            "message": "All agents have responded. Waiting for your next message.",
-                        })
+                        # ── Sequential mode: pass turn to next agent ─────────
+                        room.turn_pending = False
+                        next_agent = room.next_speaker(exclude_id=agent_id)
+                        if next_agent:
+                            await self._send_your_turn(room, next_agent)
+                        else:
+                            room.current_speaker = None
+                            log.info(f"[{room_id}] Round complete. Waiting for owner.")
+                            await self._broadcast(room, {
+                                "type": "waiting_for_owner",
+                                "message": "All agents have responded. Waiting for your next message.",
+                            })
 
                 elif msg["type"] == "leave":
                     break
@@ -627,8 +713,20 @@ class RoomServer:
                     },
                 )
 
-                # Reassign turn if the speaker just left
-                if room.current_speaker == agent.agent_id:
+                # Clean up broadcast_pending if this agent hadn't responded yet
+                if room.broadcast_pending is not None:
+                    room.broadcast_pending.discard(agent.agent_id)
+                    if not room.broadcast_pending:
+                        room.broadcast_pending = None
+                        room.current_speaker = None
+                        log.info(f"[{room.room_id}] Broadcast round complete (agent left).")
+                        await self._broadcast(room, {
+                            "type": "waiting_for_owner",
+                            "message": "All agents have responded. Waiting for your next message.",
+                        })
+
+                # Reassign turn if the speaker just left (sequential mode only)
+                elif room.current_speaker == agent.agent_id:
                     if remaining >= 1:
                         next_agent = next(iter(room.agents.values()))
                         await self._send_your_turn(room, next_agent)

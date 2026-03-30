@@ -30,7 +30,12 @@ COMMANDS = [
     ("/add-agent", "新增 AI agent 加入房間"),
     ("/kick",      "踢除房間成員"),
     ("/kick-all",  "踢除所有 AI agent"),
+    ("/broadcast", "同時向所有 agent 發話，並行回答"),
 ]
+
+# Commands that require a trailing argument — selecting from completion
+# should only fill the input (with a trailing space), not execute immediately.
+COMMANDS_WITH_ARGS = {"/broadcast"}
 
 AGENT_COLORS_CURSES = [
     curses.COLOR_CYAN,
@@ -930,7 +935,11 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                         ui.input_cursor = len(ui.input_buf)
                         ui.completing = False
                         ui.completion_items = []
-                        if ch in ('\t',):
+                        # Commands that need arguments: fill with trailing space, don't execute
+                        if ch in ('\t',) or selected in COMMANDS_WITH_ARGS:
+                            if selected in COMMANDS_WITH_ARGS:
+                                ui.input_buf += " "
+                                ui.input_cursor = len(ui.input_buf)
                             ui.render()
                             continue
                         # Enter falls through to normal Enter handler below
@@ -986,6 +995,15 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                         ]
                         ui.picker_idx = 0
                         ui.picker_mode = "kick"
+                    ui.render()
+                elif text.startswith("/broadcast"):
+                    content = text[len("/broadcast"):].strip()
+                    if not content:
+                        ui.add_line(f"{now()}  [system] 用法：/broadcast <訊息>", PAIR_YELLOW)
+                    elif not ui.agents:
+                        ui.add_line(f"{now()}  [system] 沒有 agent 可以廣播，請先 /add-agent", PAIR_YELLOW)
+                    else:
+                        await ws.send(json.dumps({"type": "broadcast", "content": content}))
                     ui.render()
                 elif text:
                     await ws.send(json.dumps({"type": "message", "content": text}))

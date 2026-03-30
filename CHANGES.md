@@ -68,6 +68,10 @@ OpenParty Server (WebSocket)
 .venv/bin/python observer_cli.py --room test-001 --owner --name Andy
 ```
 
+```
+~/3rd-party/OpenParty/.venv/bin/python ~/3rd-party/OpenParty/observer_cli.py --room 001 --owner --name Andy
+```
+
 ### 依賴
 
 ```
