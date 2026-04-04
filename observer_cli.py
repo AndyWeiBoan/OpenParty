@@ -734,9 +734,9 @@ def _parse_inline(text: str, base_pair: int, extra_attr: int = 0) -> list[tuple[
         elif full.startswith("*"):
             segments.append((m.group(3), base_pair | curses.A_DIM | extra_attr))
         elif full.startswith("#"):  # private message target
-            segments.append((full, curses.color_pair(PAIR_MAGENTA) | curses.A_BOLD | extra_attr))
-        else:  # @mention tag (highlight only, not private)
             segments.append((full, curses.color_pair(PAIR_CYAN) | curses.A_BOLD | extra_attr))
+        else:  # @mention tag (highlight only, not private)
+            segments.append((full, curses.color_pair(PAIR_YELLOW) | curses.A_BOLD | extra_attr))
         last = m.end()
     if last < len(text):
         segments.append((text[last:], base_pair | extra_attr))
