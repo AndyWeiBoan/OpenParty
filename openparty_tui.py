@@ -624,7 +624,7 @@ class OpenPartyApp(App):
         cl.hide()
         self._completing = False
         if text:
-            asyncio.create_task(self._handle_command(text))
+            self.run_worker(self._handle_command(text), exclusive=False)
 
     # ── Completion logic ───────────────────────────────────────────────────────
 
