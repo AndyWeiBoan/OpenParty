@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-_MENTION_RE = re.compile(r"@([\w][\w\-]*)")
+_MENTION_RE = re.compile(r"#([\w][\w\-]*)")
 
 import aiohttp
 import websockets
@@ -205,8 +205,9 @@ class RoomServer:
         if engine == "opencode":
             cmd += ["--opencode-model", model_id, "--model", model_id]
         else:
-            # claude engine: pass "claude-sonnet" so the model label is meaningful
-            cmd += ["--model", "claude-sonnet"]
+            # claude engine: model_id is "claude/<model-name>", extract the model name
+            claude_model = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+            cmd += ["--model", claude_model]
         if owner_name:
             cmd += ["--owner-name", owner_name]
 
@@ -547,7 +548,7 @@ class RoomServer:
                         "timestamp": timestamp,
                     }
 
-                    # ── Private message: @mention detected ───────────────────
+                    # ── Private message: #mention detected ───────────────────
                     mentions = _MENTION_RE.findall(content)
                     if mentions:
                         mention_set = set(mentions)
@@ -843,7 +844,7 @@ async def main():
     await server.startup()
 
     try:
-        async with websockets.serve(server.handle_connection, host, port):
+        async with websockets.serve(server.handle_connection, host, port, ping_interval=60, ping_timeout=300):
             log.info(f"Server ready. Engines: {server.available_engines}")
             await asyncio.Future()
     finally:

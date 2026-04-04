@@ -718,11 +718,11 @@ class ChatUI:
 MENTION_RE = re.compile(r"(@[\w][\w\-]*)")
 
 
-_INLINE_RE = re.compile(r'(\*\*(.+?)\*\*|\*(.+?)\*|@[\w][\w\-]*)', re.DOTALL)
+_INLINE_RE = re.compile(r'(\*\*(.+?)\*\*|\*(.+?)\*|#[\w][\w\-]*|@[\w][\w\-]*)', re.DOTALL)
 
 
 def _parse_inline(text: str, base_pair: int, extra_attr: int = 0) -> list[tuple[str, int]]:
-    """Parse **bold**, *italic*, and @mentions into (text, attr) segments."""
+    """Parse **bold**, *italic*, #private-mentions, and @tag-mentions into (text, attr) segments."""
     segments: list[tuple[str, int]] = []
     last = 0
     for m in _INLINE_RE.finditer(text):
@@ -733,7 +733,9 @@ def _parse_inline(text: str, base_pair: int, extra_attr: int = 0) -> list[tuple[
             segments.append((m.group(2), base_pair | curses.A_BOLD | extra_attr))
         elif full.startswith("*"):
             segments.append((m.group(3), base_pair | curses.A_DIM | extra_attr))
-        else:  # @mention
+        elif full.startswith("#"):  # private message target
+            segments.append((full, curses.color_pair(PAIR_MAGENTA) | curses.A_BOLD | extra_attr))
+        else:  # @mention tag (highlight only, not private)
             segments.append((full, curses.color_pair(PAIR_CYAN) | curses.A_BOLD | extra_attr))
         last = m.end()
     if last < len(text):
@@ -845,12 +847,12 @@ def _update_completion(ui: ChatUI):
     """Recompute completion_items based on current input_buf."""
     buf = ui.input_buf
 
-    # ── @mention completion: triggered when buffer ends with @partial ─────────
-    at_match = re.search(r"@([\w\-]*)$", buf)
+    # ── #mention completion: triggered when buffer ends with #partial (private msg) ──
+    at_match = re.search(r"#([\w\-]*)$", buf)
     if at_match and not ui.picker_mode:
         partial = at_match.group(1).lower()
         matches = [
-            (f"@{a['name']}", a.get("model", ""))
+            (f"#{a['name']}", a.get("model", ""))
             for a in ui.agents
             if a["name"].lower().startswith(partial)
         ]
@@ -1099,8 +1101,8 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                 elif ch in ('\t', curses.KEY_ENTER, '\n', '\r'):
                     selected = ui.completion_items[ui.completion_idx][0]
                     if ui.completing_type == "mention":
-                        # Replace only the trailing @partial in input_buf
-                        ui.input_buf = re.sub(r"@[\w\-]*$", selected + " ", ui.input_buf)
+                        # Replace only the trailing #partial in input_buf
+                        ui.input_buf = re.sub(r"#[\w\-]*$", selected + " ", ui.input_buf)
                         ui.input_cursor = len(ui.input_buf)
                         ui.completing = False
                         ui.completion_items = []
