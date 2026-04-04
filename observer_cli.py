@@ -13,6 +13,7 @@ import argparse
 import locale
 import re
 import signal
+import subprocess
 import sys
 import unicodedata
 from datetime import datetime
@@ -60,6 +61,7 @@ PAIR_AGENT_1   = 11
 PAIR_AGENT_2   = 12
 PAIR_AGENT_3   = 13
 PAIR_AGENT_4   = 14
+PAIR_OWNER     = 15
 
 agent_color_map: dict[str, int] = {}  # name → curses pair ID
 message_queue: asyncio.Queue = asyncio.Queue()
@@ -202,6 +204,14 @@ class ChatUI:
         # Scroll state (0 = bottom / latest, positive = scrolled up)
         self.scroll_offset = 0
 
+        # Selection state (line indices into self.lines; None = no selection)
+        self.sel_start: int | None = None
+        self.sel_end: int | None = None
+        self._mouse_selecting = False
+
+        # Multi-line input tracking
+        self._last_input_h = 1
+
         self._setup_colors()
         self._setup_windows()
 
@@ -222,6 +232,7 @@ class ChatUI:
         curses.init_pair(PAIR_AGENT_2,   curses.COLOR_GREEN,   -1)
         curses.init_pair(PAIR_AGENT_3,   curses.COLOR_MAGENTA, -1)
         curses.init_pair(PAIR_AGENT_4,   curses.COLOR_BLUE,    -1)
+        curses.init_pair(PAIR_OWNER,     curses.COLOR_BLACK,   curses.COLOR_WHITE)
 
     def _setup_windows(self):
         h, w = self.stdscr.getmaxyx()
@@ -237,10 +248,11 @@ class ChatUI:
         _btn5 = getattr(curses, "BUTTON5_PRESSED", 0x08000000)
         self._mouse_btn5 = _btn5
         curses.mousemask(
-            curses.BUTTON4_PRESSED   # wheel up
-            | _btn5                  # wheel down (0x08000000 on macOS)
-            | curses.BUTTON1_CLICKED # left click (scrollbar jump)
-            | curses.REPORT_MOUSE_POSITION
+            curses.BUTTON4_PRESSED    # wheel up
+            | _btn5                   # wheel down (0x08000000 on macOS)
+            | curses.BUTTON1_PRESSED  # selection start
+            | curses.BUTTON1_RELEASED # selection end
+            | curses.BUTTON1_CLICKED  # left click (scrollbar jump)
         )
         try:
             curses.curs_set(1)
@@ -260,32 +272,37 @@ class ChatUI:
         self.picker_idx = 0
 
     def resize(self):
-        """Recreate all sub-windows after terminal resize or focus restore."""
+        """Resize existing sub-windows in-place after terminal resize or focus restore."""
         try:
             curses.update_lines_cols()
         except AttributeError:
             pass
         h, w = self.stdscr.getmaxyx()
-        try:
-            curses.resizeterm(h, w)
-        except Exception:
-            pass
+        chat_h = max(1, h - 2)
+        chat_w = max(1, w)
         # Discard stale popup windows
         self.completion_win = None
         self.model_win = None
-        # Rebuild main windows at new dimensions
-        self.chat_win  = curses.newwin(max(1, h - 2), max(1, w), 0, 0)
-        self.sep_win   = curses.newwin(1, max(1, w), max(0, h - 2), 0)
-        self.input_win = curses.newwin(1, max(1, w), max(0, h - 1), 0)
-        self.chat_h = max(1, h - 2)
-        self.chat_w = max(1, w)
+        # Resize existing windows in-place (no destroy/create gap)
+        try:
+            self.chat_win.resize(chat_h, chat_w)
+            self.sep_win.resize(1, chat_w)
+            self.sep_win.mvwin(max(0, h - 2), 0)
+            self.input_win.resize(1, chat_w)
+            self.input_win.mvwin(max(0, h - 1), 0)
+        except curses.error:
+            # Fallback: recreate if resize/mvwin fails (e.g. terminal too small)
+            self.chat_win  = curses.newwin(chat_h, chat_w, 0, 0)
+            self.sep_win   = curses.newwin(1, chat_w, max(0, h - 2), 0)
+            self.input_win = curses.newwin(1, chat_w, max(0, h - 1), 0)
+        self.chat_h = chat_h
+        self.chat_w = chat_w
         self.term_h = h
-        # Force full physical repaint (covers screen corruption on window switch)
-        self.stdscr.clearok(True)
+        self._last_input_h = 1
         self.render()
 
     def _redraw_sep(self):
-        self.sep_win.clear()
+        self.sep_win.erase()
         self.sep_win.bkgd(' ', curses.color_pair(PAIR_INPUT_BAR))
         if self.owner:
             hint = f" [{self.name}] Type message and Enter to send. /leave to exit."
@@ -294,36 +311,60 @@ class ChatUI:
         self.sep_win.addstr(0, 0, hint[:self.chat_w - 1], curses.color_pair(PAIR_INPUT_BAR))
         self.sep_win.noutrefresh()
 
-    def _redraw_input(self):
-        self.input_win.clear()
-        prompt = "> "
-        prompt_w = 2
-        max_w = self.chat_w - 1
-        content_w = max_w - prompt_w
-
-        before_cursor = self.input_buf[:self.input_cursor]
-        after_cursor = self.input_buf[self.input_cursor:]
-        before_w = display_width(before_cursor)
-
-        if before_w <= content_w:
-            # Cursor is within view: show from beginning, truncate tail
-            visible_text = truncate_head(self.input_buf, content_w)
-            cursor_x = prompt_w + before_w
-        else:
-            # Text before cursor overflows: scroll so cursor stays near right edge
-            visible_before = truncate_to_display_width(before_cursor, content_w - 1)
-            visible_before_w = display_width(visible_before)
-            cursor_x = prompt_w + visible_before_w
-            avail_after = max_w - cursor_x
-            visible_after = truncate_head(after_cursor, avail_after)
-            visible_text = visible_before + visible_after
-
+    def _update_input_layout(self):
+        """Resize input_win and chat_win when number of input lines changes."""
+        new_h = max(1, min(5, self.input_buf.count('\n') + 1))
+        if new_h == self._last_input_h:
+            return
+        self._last_input_h = new_h
+        h = self.term_h
+        w = self.chat_w
+        new_chat_h = max(1, h - 1 - new_h)
         try:
-            self.input_win.addstr(0, 0, prompt + visible_text)
+            self.chat_win.resize(new_chat_h, w)
+            self.sep_win.mvwin(max(0, h - 1 - new_h), 0)
+            self.input_win.resize(new_h, w)
+            self.input_win.mvwin(max(0, h - new_h), 0)
         except curses.error:
             pass
+        self.chat_h = new_chat_h
+
+    def _redraw_input(self):
+        self._update_input_layout()
+        self.input_win.erase()
+        prompt_w = 2
+        content_w = max(1, self.chat_w - 1 - prompt_w)
+
+        input_lines = self.input_buf.split('\n')
+        before_cursor = self.input_buf[:self.input_cursor]
+        cur_line_idx = before_cursor.count('\n')
+        cur_line_before = before_cursor.split('\n')[-1]
+
+        # Which lines to show (scroll so cursor is always visible)
+        input_h = self._last_input_h
+        start_line = max(0, cur_line_idx - input_h + 1)
+
+        for row in range(input_h):
+            line_idx = start_line + row
+            if line_idx >= len(input_lines):
+                break
+            line_text = input_lines[line_idx]
+            prompt = "> " if line_idx == 0 else "  "
+            before_w = display_width(line_text)
+            if before_w <= content_w:
+                visible = truncate_head(line_text, content_w)
+            else:
+                visible = truncate_to_display_width(line_text, content_w)
+            try:
+                self.input_win.addstr(row, 0, prompt + visible)
+            except curses.error:
+                pass
+
+        # Position cursor
+        cursor_row = cur_line_idx - start_line
+        cursor_x = prompt_w + display_width(cur_line_before)
         try:
-            self.input_win.move(0, min(cursor_x, self.chat_w - 1))
+            self.input_win.move(cursor_row, min(cursor_x, self.chat_w - 1))
         except curses.error:
             pass
         self.input_win.noutrefresh()
@@ -349,12 +390,15 @@ class ChatUI:
         self.scroll_offset = min(self.scroll_offset, max_offset)
 
         start = max(0, total - visible - self.scroll_offset)
+        sel_lo = min(self.sel_start, self.sel_end) if self.sel_start is not None and self.sel_end is not None else None
+        sel_hi = max(self.sel_start, self.sel_end) if self.sel_start is not None and self.sel_end is not None else None
         for row in range(visible):
             idx = start + row
             if idx >= total:
                 break
             text, pair = self.lines[idx]
-            _render_line_with_mentions(self.chat_win, row, text, pair)
+            extra = curses.A_REVERSE if sel_lo is not None and sel_lo <= idx <= sel_hi else 0
+            _render_line_with_mentions(self.chat_win, row, text, pair, extra)
 
         # Scrollbar on rightmost column
         if total > visible:
@@ -509,6 +553,46 @@ class ChatUI:
         except curses.error:
             pass
 
+    def _screen_row_to_line_idx(self, y: int) -> int | None:
+        """Convert a chat-window row to a self.lines index. None if out of range."""
+        total = len(self.lines)
+        visible = self.chat_h
+        start = max(0, total - visible - self.scroll_offset)
+        idx = start + y
+        return idx if 0 <= idx < total else None
+
+    def _get_selected_text(self) -> str:
+        if self.sel_start is None or self.sel_end is None:
+            return ""
+        lo = min(self.sel_start, self.sel_end)
+        hi = max(self.sel_start, self.sel_end)
+        # Strip inline markdown markers from copied text
+        md_re = re.compile(r'\*\*(.+?)\*\*|\*(.+?)\*', re.DOTALL)
+        lines = []
+        for idx in range(lo, hi + 1):
+            if idx < len(self.lines):
+                raw, _ = self.lines[idx]
+                clean = md_re.sub(lambda m: m.group(1) or m.group(2), raw)
+                lines.append(clean)
+        return "\n".join(lines)
+
+    def copy_selection(self) -> bool:
+        """Copy selected text to clipboard via pbcopy. Returns True on success."""
+        text = self._get_selected_text()
+        if not text:
+            return False
+        try:
+            proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            proc.communicate(text.encode("utf-8"))
+            return True
+        except Exception:
+            return False
+
+    def clear_selection(self):
+        self.sel_start = None
+        self.sel_end = None
+        self._mouse_selecting = False
+
     def render(self):
         self._redraw_chat()
         self._redraw_sep()
@@ -608,7 +692,8 @@ class ChatUI:
         content = entry.get("content", "")
         is_private = entry.get("is_private", False)
         private_to = entry.get("private_to", [])
-        pair = color_pair_for(name)
+        is_owner_msg = name.startswith("[owner]")
+        pair = curses.color_pair(PAIR_OWNER) if is_owner_msg else color_pair_for(name)
         self.add_line("", PAIR_DIM)
         model_label = _model_label(model)
         header = f"  {name}  ({model_label})" if model_label else f"  {name}"
@@ -620,6 +705,10 @@ class ChatUI:
             self.add_line(header + whisper_tag, curses.color_pair(PAIR_MAGENTA) | curses.A_BOLD)
             for line in content.split("\n"):
                 self.add_line(f"    {line}", curses.color_pair(PAIR_MAGENTA))
+        elif is_owner_msg:
+            self.add_line(header, curses.color_pair(PAIR_OWNER) | curses.A_BOLD)
+            for line in content.split("\n"):
+                self.add_line(f"    {line}", curses.color_pair(PAIR_OWNER))
         else:
             self.add_line(header, pair | curses.A_BOLD)
             for line in content.split("\n"):
@@ -629,23 +718,41 @@ class ChatUI:
 MENTION_RE = re.compile(r"(@[\w][\w\-]*)")
 
 
-def _render_line_with_mentions(win, y: int, text: str, base_pair: int):
-    """Render a line of text, highlighting @mentions in cyan+bold."""
-    parts = MENTION_RE.split(text)
+_INLINE_RE = re.compile(r'(\*\*(.+?)\*\*|\*(.+?)\*|@[\w][\w\-]*)', re.DOTALL)
+
+
+def _parse_inline(text: str, base_pair: int, extra_attr: int = 0) -> list[tuple[str, int]]:
+    """Parse **bold**, *italic*, and @mentions into (text, attr) segments."""
+    segments: list[tuple[str, int]] = []
+    last = 0
+    for m in _INLINE_RE.finditer(text):
+        if m.start() > last:
+            segments.append((text[last:m.start()], base_pair | extra_attr))
+        full = m.group(0)
+        if full.startswith("**"):
+            segments.append((m.group(2), base_pair | curses.A_BOLD | extra_attr))
+        elif full.startswith("*"):
+            segments.append((m.group(3), base_pair | curses.A_DIM | extra_attr))
+        else:  # @mention
+            segments.append((full, curses.color_pair(PAIR_CYAN) | curses.A_BOLD | extra_attr))
+        last = m.end()
+    if last < len(text):
+        segments.append((text[last:], base_pair | extra_attr))
+    return segments
+
+
+def _render_line_with_mentions(win, y: int, text: str, base_pair: int, extra_attr: int = 0):
+    """Render a line of text with **bold**, *italic*, and @mention highlighting."""
+    segments = _parse_inline(text, curses.color_pair(base_pair), extra_attr)
     x = 0
     max_x = win.getmaxyx()[1] - 1
-    for part in parts:
-        if not part or x >= max_x:
+    for seg_text, attr in segments:
+        if not seg_text or x >= max_x:
             break
-        if part.startswith("@"):
-            pair = curses.color_pair(PAIR_CYAN) | curses.A_BOLD
-        else:
-            pair = curses.color_pair(base_pair)
-        # Truncate the part so it doesn't overflow the window width
-        safe = truncate_head(part, max_x - x)
+        safe = truncate_head(seg_text, max_x - x)
         if safe:
             try:
-                win.addstr(y, x, safe, pair)
+                win.addstr(y, x, safe, attr)
             except curses.error:
                 break
             x += display_width(safe)
@@ -709,12 +816,17 @@ async def fetch_models(available_engines: list[str]) -> list[dict]:
 
     # ── Claude engine (claude_agent_sdk bundled binary) ───────────────────────
     if "claude" in available_engines:
-        result.append({
-            "display": "claude - Claude (Max / Pro subscription)",
-            "full_id": "claude/default",
-            "engine": "claude",
-            "base_name": "claude",
-        })
+        for model_id, label, base in [
+            ("claude-opus-4-6",   "Opus 4.6  · Most capable",     "claude-opus"),
+            ("claude-sonnet-4-6", "Sonnet 4.6 · Best for everyday", "claude-sonnet"),
+            ("claude-haiku-4-5",  "Haiku 4.5  · Fastest",          "claude-haiku"),
+        ]:
+            result.append({
+                "display": f"claude - {label}",
+                "full_id": f"claude/{model_id}",
+                "engine": "claude",
+                "base_name": base,
+            })
 
     return result
 
@@ -771,6 +883,12 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
     stdscr.nodelay(True)
     curses.cbreak()
     stdscr.keypad(True)
+    # Read input from input_win instead of stdscr so that the implicit
+    # wrefresh(win) inside get_wch() refreshes input_win (cursor stays in
+    # the input bar) rather than stdscr (which would flash the cursor to
+    # stdscr's (0,0) position — i.e. the chat area — on every poll).
+    ui.input_win.nodelay(True)
+    ui.input_win.keypad(True)
 
     # SIGWINCH fires on terminal resize and, on some macOS terminals, on
     # focus restore — both cases should trigger a full window rebuild.
@@ -793,22 +911,27 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
         if _resize_needed:
             _resize_needed = False
             ui.resize()
+            ui.input_win.nodelay(True)
+            ui.input_win.keypad(True)
 
         # Process all pending server messages
         while not message_queue.empty():
             msg = await message_queue.get()
             ui.handle_event(msg)
 
-        # Check keyboard input — get_wch() supports Unicode (including CJK)
+        # Check keyboard input — get_wch() supports Unicode (including CJK).
+        # Use input_win (not stdscr) so the implicit wrefresh inside get_wch
+        # keeps the cursor in the input bar rather than flashing it to chat.
         ch = None
         try:
-            ch = stdscr.get_wch()
+            ch = ui.input_win.get_wch()
         except curses.error:
             pass
 
         if ch is not None:
             # ── Terminal resize ──────────────────────────────────────────────
             if ch == curses.KEY_RESIZE:
+                _resize_needed = False  # prevent double resize from SIGWINCH
                 ui.resize()
                 continue
 
@@ -847,16 +970,60 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                     ui._redraw_chat()
                     curses.doupdate()
                     continue
-                # ── Click on scrollbar column ─────────────────────────
+                # ── Text selection ────────────────────────────────────
+                elif bstate & curses.BUTTON1_PRESSED:
+                    # Always clear existing selection first
+                    ui.clear_selection()
+                    if 0 <= my < ui.chat_h:
+                        idx = ui._screen_row_to_line_idx(my)
+                        if idx is not None:
+                            ui.sel_start = idx
+                            ui.sel_end = idx
+                            ui._mouse_selecting = True
+                    ui._redraw_chat()
+                    curses.doupdate()
+                    continue
+                elif bstate & curses.BUTTON1_RELEASED:
+                    if ui._mouse_selecting:
+                        ui._mouse_selecting = False
+                        if 0 <= my < ui.chat_h:
+                            idx = ui._screen_row_to_line_idx(my)
+                            if idx is not None:
+                                ui.sel_end = idx
+                        # If start == end (single click, no drag) → clear selection
+                        if ui.sel_start == ui.sel_end:
+                            ui.clear_selection()
+                        ui._redraw_chat()
+                        curses.doupdate()
+                    continue
+                # ── Click: clear selection, optionally jump scrollbar ────────
                 elif bstate & curses.BUTTON1_CLICKED:
+                    if ui.sel_start is not None:
+                        ui.clear_selection()
+                        ui._redraw_chat()
+                        curses.doupdate()
                     scrollbar_x = ui.chat_w - 1
                     if mx == scrollbar_x and 0 <= my < ui.chat_h and max_offset > 0:
-                        # Map click row → scroll offset (inverted: top = oldest)
                         ratio = my / max(1, ui.chat_h - 1)
                         ui.scroll_offset = int(max_offset * (1.0 - ratio))
                         ui._redraw_chat()
                         curses.doupdate()
                     continue
+
+        # ── Ctrl+C: copy selection (works for owner and observer) ──────────
+        if ch == '\x03' and ui.sel_start is not None:
+            ui.copy_selection()
+            ui.clear_selection()
+            ui._redraw_chat()
+            curses.doupdate()
+            continue
+
+        # ── Any keyboard input clears selection and returns focus to input ──
+        if ch is not None and ch != curses.KEY_MOUSE and ui.sel_start is not None:
+            if ch not in (curses.KEY_PPAGE, curses.KEY_NPAGE, curses.KEY_END, curses.KEY_RESIZE):
+                ui.clear_selection()
+                ui._redraw_chat()
+                curses.doupdate()
 
         if ch is not None and owner:
             # ── Picker mode (add-agent / kick) ──────────────────────────────
@@ -959,6 +1126,23 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                     ui.completion_items = []
                     ui.render()
                     continue
+
+            # ── Shift+Enter (Alt+Enter): insert newline ─────────────────────
+            if ch == '\x1b':
+                # Peek immediately for Alt+Enter (Esc followed by Enter)
+                try:
+                    next_ch = stdscr.get_wch()
+                    if next_ch in ('\r', '\n'):
+                        ui.input_buf = (
+                            ui.input_buf[:ui.input_cursor] + '\n' +
+                            ui.input_buf[ui.input_cursor:]
+                        )
+                        ui.input_cursor += 1
+                        ui.render()
+                    # else: stray escape, ignore both characters
+                except curses.error:
+                    pass  # lone Esc, ignore
+                continue
 
             # ── Normal input ────────────────────────────────────────────────
             if ch in (curses.KEY_ENTER, '\n', '\r'):
