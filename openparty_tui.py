@@ -320,7 +320,7 @@ class _PickerScreen(ModalScreen):
     def action_move_down(self) -> None:
         self.query_one("#picker-list", ListView).action_cursor_down()
 
-    def on_list_view_selected(self, event: ListView.Selected) -> None:  # noqa: ARG002
+    def on_list_view_selected(self, _event: ListView.Selected) -> None:  # type: ignore[override]  # pyright: ignore[reportUnusedParameter]
         self._do_pick()
 
     def action_pick(self) -> None:
@@ -348,8 +348,7 @@ class ModelPickerScreen(_PickerScreen):
         self._refresh_list()
         self.query_one("#picker-search", Input).focus()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Enter in the search box confirms the current selection."""
+    def on_input_submitted(self, _event: Input.Submitted) -> None:  # type: ignore[override, reportUnusedParameter]
         self._do_pick()
 
     def on_input_changed(self, event: Input.Changed) -> None:
