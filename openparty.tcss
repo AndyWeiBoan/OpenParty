@@ -1,0 +1,58 @@
+Screen {
+    layout: vertical;
+}
+
+ChatLog {
+    height: 1fr;
+}
+
+CompletionList {
+    height: auto;
+    max-height: 18;
+    background: $panel;
+    border: solid $accent;
+    padding: 0 1;
+}
+
+SepBar {
+    height: 1;
+    background: white;
+    color: black;
+}
+
+MessageInput {
+    height: 3;
+    background: $background;
+    border: tall $panel-lighten-2;
+    padding: 0 1;
+}
+
+ModelPickerScreen,
+KickPickerScreen {
+    align: center middle;
+}
+
+#picker-box {
+    width: 72;
+    max-height: 28;
+    background: $panel;
+    border: solid $accent;
+}
+
+#picker-title {
+    background: $accent;
+    color: $text;
+    padding: 0 1;
+    text-style: bold;
+}
+
+#picker-search {
+    height: 3;
+    border: tall $panel-lighten-1;
+    background: $panel-darken-1;
+}
+
+#picker-list {
+    height: auto;
+    max-height: 18;
+}
