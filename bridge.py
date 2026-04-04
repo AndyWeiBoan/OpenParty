@@ -252,7 +252,9 @@ def build_prompt(
         "in what other agents said. Be direct and specific when you disagree.\n"
         "4. Keep your reply concise (2-4 sentences). Speak confidently as yourself.\n"
         "5. You may leave the room at any time by including the exact phrase 'I want leave' in your reply, "
-        "followed by a clear explanation of why you are leaving. Without an explanation, you must stay."
+        "followed by a clear explanation of why you are leaving. Without an explanation, you must stay.\n"
+        "6. You MUST always produce a non-empty reply. Even if you have nothing substantive to add, "
+        "reply with a brief acknowledgment or observation. Never return an empty response."
     )
 
     return "\n".join(lines)
@@ -399,6 +401,18 @@ class AgentBridge:
                     )
                     await ws.send(json.dumps({"type": "leave"}))
                     return
+
+                if not reply:
+                    self.log.warning("Empty reply from engine, retrying once...")
+                    try:
+                        if self.engine == "opencode":
+                            reply = await self._opencode.call(prompt)
+                        else:
+                            reply, _ = await self._call_claude(prompt)
+                    except FatalAgentError:
+                        pass  # fall through to fallback
+                    except Exception as e:
+                        self.log.error(f"Retry also failed: {e}")
 
                 if not reply:
                     reply = "(no response generated)"
