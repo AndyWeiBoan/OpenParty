@@ -348,6 +348,10 @@ class ModelPickerScreen(_PickerScreen):
         self._refresh_list()
         self.query_one("#picker-search", Input).focus()
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the search box confirms the current selection."""
+        self._do_pick()
+
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "picker-search":
             query = event.value.lower()
