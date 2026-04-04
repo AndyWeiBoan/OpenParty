@@ -847,16 +847,16 @@ def _update_completion(ui: ChatUI):
     """Recompute completion_items based on current input_buf."""
     buf = ui.input_buf
 
-    # ── #mention completion: triggered when buffer ends with #partial (private msg) ──
-    at_match = re.search(r"#([\w\-]*)$", buf)
+    # ── # / @ mention completion ─────────────────────────────────────────────
+    at_match = re.search(r"([#@])([\w\-]*)$", buf)
     if at_match and not ui.picker_mode:
-        partial = at_match.group(1).lower()
+        sigil = at_match.group(1)   # '#' or '@'
+        partial = at_match.group(2).lower()
         matches = [
-            (f"#{a['name']}", a.get("model", ""))
+            (f"{sigil}{a['name']}", a.get("model", ""))
             for a in ui.agents
             if a["name"].lower().startswith(partial)
         ]
-        # Also match observer's own name if ui.name is available and not the owner
         if matches:
             ui.completing = True
             ui.completing_type = "mention"
@@ -1101,8 +1101,8 @@ async def ui_loop(stdscr, ws, ui: ChatUI, owner: bool):
                 elif ch in ('\t', curses.KEY_ENTER, '\n', '\r'):
                     selected = ui.completion_items[ui.completion_idx][0]
                     if ui.completing_type == "mention":
-                        # Replace only the trailing #partial in input_buf
-                        ui.input_buf = re.sub(r"#[\w\-]*$", selected + " ", ui.input_buf)
+                        # Replace only the trailing #partial or @partial in input_buf
+                        ui.input_buf = re.sub(r"[#@][\w\-]*$", selected + " ", ui.input_buf)
                         ui.input_cursor = len(ui.input_buf)
                         ui.completing = False
                         ui.completion_items = []
