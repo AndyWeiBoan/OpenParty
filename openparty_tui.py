@@ -373,8 +373,8 @@ class ModelPickerScreen(_PickerScreen):
 
     def _do_pick(self) -> None:
         lv = self.query_one("#picker-list", ListView)
-        idx = lv.index
-        if idx is not None and 0 <= idx < len(self.filtered):
+        idx = lv.index if lv.index is not None else 0  # default to first item
+        if self.filtered and 0 <= idx < len(self.filtered):
             self.dismiss(self.filtered[idx])
         else:
             self.dismiss(None)
