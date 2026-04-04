@@ -1,9 +1,14 @@
 Screen {
     layout: vertical;
+    background: #0a1a0a;
 }
 
 ChatLog {
     height: 1fr;
+    background: #0a1a0a;
+    color: #00ff41;
+    scrollbar-color: #444444;
+    scrollbar-color-hover: #888888;
 }
 
 CompletionList {
@@ -16,15 +21,16 @@ CompletionList {
 
 SepBar {
     height: 1;
-    background: white;
-    color: black;
+    background: #ffaa00;
+    color: #0a1a0a;
 }
 
 MessageInput {
     height: 3;
-    background: $background;
-    border: tall $panel-lighten-2;
+    background: #0a1a0a;
+    border: tall #ffaa00;
     padding: 0 1;
+    color: #ffdd00;
 }
 
 ModelPickerScreen,
@@ -55,4 +61,22 @@ KickPickerScreen {
 #picker-list {
     height: auto;
     max-height: 18;
+    background: $panel;
+}
+
+#picker-list ListItem {
+    background: $panel;
+}
+
+#picker-list ListItem.-highlight {
+    background: $accent;
+}
+
+#picker-list ListItem Label {
+    color: $text;
+}
+
+#picker-list ListItem.-highlight Label {
+    color: $background;
+    text-style: bold;
 }

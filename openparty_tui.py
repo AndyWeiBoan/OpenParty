@@ -24,7 +24,7 @@ from textual.containers import Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, RichLog, Static
-
+from textual.timer import Timer
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -33,10 +33,10 @@ OPENCODE_URL = "http://127.0.0.1:4096"
 OPENPARTY_SERVER = "ws://localhost:8765"
 
 COMMANDS = [
-    ("/leave",     "離開房間"),
+    ("/leave", "離開房間"),
     ("/add-agent", "新增 AI agent 加入房間"),
-    ("/kick",      "踢除房間成員"),
-    ("/kick-all",  "踢除所有 AI agent"),
+    ("/kick", "踢除房間成員"),
+    ("/kick-all", "踢除所有 AI agent"),
     ("/broadcast", "同時向所有 agent 發話，並行回答"),
 ]
 
@@ -48,18 +48,19 @@ _agent_color_map: dict[str, str] = {}
 
 # ── Style constants ────────────────────────────────────────────────────────────
 
-OWNER_STYLE   = Style(color="black", bgcolor="white", bold=True)
-OWNER_BODY    = Style(color="black", bgcolor="white")
-DIM_STYLE     = Style(color="bright_black")
-BOLD_STYLE    = Style(bold=True, color="white")
+OWNER_STYLE = Style(color="black", bgcolor="white", bold=True)
+OWNER_BODY = Style(color="black", bgcolor="white")
+DIM_STYLE = Style(color="gray70")
+BOLD_STYLE = Style(bold=True, color="white")
 MAGENTA_STYLE = Style(color="magenta")
-GREEN_STYLE   = Style(color="green")
-RED_STYLE     = Style(color="red")
-YELLOW_STYLE  = Style(color="yellow")
-CYAN_STYLE    = Style(color="cyan")
+GREEN_STYLE = Style(color="green")
+RED_STYLE = Style(color="red")
+YELLOW_STYLE = Style(color="yellow")
+CYAN_STYLE = Style(color="cyan")
 
 
 # ── Helper functions ───────────────────────────────────────────────────────────
+
 
 def _agent_style(name: str) -> Style:
     """Return a round-robin Rich Style for this agent name, memoized."""
@@ -81,7 +82,7 @@ def now() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-_INLINE_RE = re.compile(r'(\*\*(.+?)\*\*|\*(.+?)\*|#[\w][\w\-]*|@[\w][\w\-]*)')
+_INLINE_RE = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*|#[\w][\w\-]*|@[\w][\w\-]*)")
 
 
 def _parse_to_rich(text: str, base_style: Style) -> Text:
@@ -90,7 +91,7 @@ def _parse_to_rich(text: str, base_style: Style) -> Text:
     last = 0
     for m in _INLINE_RE.finditer(text):
         if m.start() > last:
-            result.append(text[last:m.start()], style=base_style)
+            result.append(text[last : m.start()], style=base_style)
         full = m.group(0)
         if full.startswith("**"):
             inner = m.group(2)
@@ -110,6 +111,7 @@ def _parse_to_rich(text: str, base_style: Style) -> Text:
 
 # ── Custom Messages ────────────────────────────────────────────────────────────
 
+
 class ServerMessage(Message):
     def __init__(self, data: dict) -> None:
         super().__init__()
@@ -118,17 +120,20 @@ class ServerMessage(Message):
 
 # ── Widgets ────────────────────────────────────────────────────────────────────
 
+
 class ChatLog(RichLog):
     """Scrollable chat log with page-up/down/end key bindings."""
 
     BINDINGS = [
-        Binding("pageup",   "scroll_page_up",   "Page Up",   show=False),
-        Binding("pagedown", "scroll_page_down",  "Page Down", show=False),
-        Binding("end",      "scroll_to_end",     "End",       show=False),
+        Binding("pageup", "scroll_page_up", "Page Up", show=False),
+        Binding("pagedown", "scroll_page_down", "Page Down", show=False),
+        Binding("end", "scroll_to_end", "End", show=False),
     ]
 
     def __init__(self, **kwargs):
-        super().__init__(auto_scroll=False, highlight=False, markup=False, wrap=True, **kwargs)
+        super().__init__(
+            auto_scroll=False, highlight=False, markup=False, wrap=True, **kwargs
+        )
 
     def write_msg(self, content: "Text | str") -> None:
         at_bottom = self.scroll_y >= self.max_scroll_y
@@ -142,6 +147,86 @@ class ChatLog(RichLog):
 
     def action_scroll_to_end(self) -> None:
         self.scroll_end(animate=False)
+
+
+class RoomHeader(Static):
+    """Sticky header pinned at top showing room info."""
+
+    DEFAULT_CSS = """
+    RoomHeader {
+        height: auto;
+        width: 100%;
+        background: #0a1a0a;
+        color: #ffaa00;
+        border-bottom: solid #ffaa00;
+        padding: 0 1;
+        text-style: bold;
+    }
+    """
+
+    SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def update_info(
+        self,
+        room_id: str,
+        topic: str,
+        agents: list,
+        thinking: set | None = None,
+        frame: int = 0,
+    ) -> None:
+        thinking = thinking or set()
+        parts = []
+        for a in agents:
+            name = a["name"]
+            if name in thinking:
+                spin = self.SPINNER[frame % len(self.SPINNER)]
+                parts.append(f"{name}[{spin} thinking]")
+            else:
+                parts.append(f"{name}[idle]")
+        agent_str = ", ".join(parts) if parts else "(waiting...)"
+        self.update(
+            f"OpenParty — Room: {room_id}   Topic: {topic}\nAgents: {agent_str}"
+        )
+
+
+class ThinkingBar(Static):
+    """Animated spinner shown while an agent is thinking."""
+
+    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    DEFAULT_CSS = """
+    ThinkingBar {
+        height: 1;
+        width: 100%;
+        background: #0a1a0a;
+        color: #ffaa00;
+        padding: 0 1;
+        display: none;
+    }
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._frame = 0
+        self._agent_name = ""
+        self._timer: Timer | None = None
+
+    def start(self, agent_name: str) -> None:
+        self._agent_name = agent_name
+        self._frame = 0
+        self.display = True
+        self._timer = self.set_interval(0.1, self._tick)
+
+    def stop(self) -> None:
+        if self._timer:
+            self._timer.stop()
+            self._timer = None
+        self.display = False
+
+    def _tick(self) -> None:
+        frame = self.SPINNER_FRAMES[self._frame % len(self.SPINNER_FRAMES)]
+        self.update(f"{frame} {self._agent_name} is thinking...")
+        self._frame += 1
 
 
 class SepBar(Static):
@@ -163,9 +248,9 @@ class SepBar(Static):
 
     def on_mount(self) -> None:
         if self._owner:
-            self.update(f" [{self._name}] Type message + Enter to send. /leave to exit.")
+            self.update(f" {self._name}  Type message + Enter to send. /leave to exit.")
         else:
-            self.update(f" [Observer: {self._name}] Read-only mode.")
+            self.update(f" Observer: {self._name}  Read-only mode.")
 
 
 class CompletionList(Static):
@@ -226,7 +311,9 @@ class CompletionList(Static):
                 if self.completing_type == "mention":
                     lines.append(f"[bold cyan]▶ {escaped_value}[/]")
                 else:
-                    lines.append(f"[bold cyan]▶  {escaped_value:<22} [dim]{escaped_desc}[/dim][/]")
+                    lines.append(
+                        f"[bold cyan]▶  {escaped_value:<22} [dim]{escaped_desc}[/dim][/]"
+                    )
             else:
                 if self.completing_type == "mention":
                     lines.append(f"[dim]{escaped_value}[/dim]")
@@ -270,14 +357,15 @@ class MessageInput(Input):
 
 # ── Modal Screens ──────────────────────────────────────────────────────────────
 
+
 class _PickerScreen(ModalScreen):
     """Base class for modal picker dialogs."""
 
     BINDINGS = [
         Binding("escape", "dismiss_none", "Cancel", show=False),
-        Binding("up",     "move_up",      "Up",     show=False),
-        Binding("down",   "move_down",    "Down",   show=False),
-        Binding("enter",  "pick",         "Select", show=False),
+        Binding("up", "move_up", "Up", show=False),
+        Binding("down", "move_down", "Down", show=False),
+        Binding("enter", "pick", "Select", show=False),
     ]
 
     DEFAULT_CSS = """
@@ -356,7 +444,8 @@ class ModelPickerScreen(_PickerScreen):
             query = event.value.lower()
             if query:
                 self.filtered = [
-                    item for item in self.all_items
+                    item
+                    for item in self.all_items
                     if query in item.get("display", "").lower()
                 ]
             else:
@@ -369,7 +458,9 @@ class ModelPickerScreen(_PickerScreen):
         for item in self.filtered:
             lv.append(ListItem(Label(rich_escape(item["display"]))))
         title = self.query_one("#picker-title", Static)
-        title.update(f" 選擇 Agent [{len(self.filtered)}/{len(self.all_items)}]  ↑↓ Enter Esc ")
+        title.update(
+            f" 選擇 Agent [{len(self.filtered)}/{len(self.all_items)}]  ↑↓ Enter Esc "
+        )
 
     def _do_pick(self) -> None:
         lv = self.query_one("#picker-list", ListView)
@@ -409,6 +500,7 @@ class KickPickerScreen(_PickerScreen):
 
 # ── Main Application ───────────────────────────────────────────────────────────
 
+
 class OpenPartyApp(App):
     CSS_PATH = "openparty.tcss"
 
@@ -443,9 +535,10 @@ class OpenPartyApp(App):
         return f"[owner] {self.owner_name}" if self.owner else self.owner_name
 
     def compose(self) -> ComposeResult:
+        yield RoomHeader(id="room-header")
         yield ChatLog(id="chat")
         yield CompletionList()
-
+        yield ThinkingBar(id="thinking-bar")
         yield SepBar(self.owner, self.display_name)
         if self.owner:
             yield MessageInput(placeholder="> ", id="input")
@@ -461,13 +554,17 @@ class OpenPartyApp(App):
         try:
             async with websockets.connect(self.server_url) as ws:
                 self.ws = ws
-                await ws.send(json.dumps({
-                    "type": "join",
-                    "role": "observer",
-                    "room_id": self.room_id,
-                    "name": self.display_name,
-                    "owner": self.owner,
-                }))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "join",
+                            "role": "observer",
+                            "room_id": self.room_id,
+                            "name": self.display_name,
+                            "owner": self.owner,
+                        }
+                    )
+                )
                 async for raw in ws:
                     self.post_message(ServerMessage(json.loads(raw)))
         except ConnectionRefusedError:
@@ -507,7 +604,9 @@ class OpenPartyApp(App):
                 whisper_tag = f" 【私訊 → {', '.join(private_to)}】"
             else:
                 whisper_tag = " 【私訊】"
-            header_text = Text(header_str + whisper_tag, style=Style(color="magenta", bold=True))
+            header_text = Text(
+                header_str + whisper_tag, style=Style(color="magenta", bold=True)
+            )
             self._chat(header_text)
             for line in content.split("\n"):
                 self._chat(_parse_to_rich(f"    {line}", MAGENTA_STYLE))
@@ -517,7 +616,9 @@ class OpenPartyApp(App):
                 self._chat(_parse_to_rich(f"    {line}", OWNER_BODY))
         else:
             agent_st = _agent_style(name)
-            header_text = Text(header_str, style=Style.combine([agent_st, Style(bold=True)]))
+            header_text = Text(
+                header_str, style=Style.combine([agent_st, Style(bold=True)])
+            )
             self._chat(header_text)
             for line in content.split("\n"):
                 self._chat(_parse_to_rich(f"    {line}", DIM_STYLE))
@@ -535,36 +636,51 @@ class OpenPartyApp(App):
             participants = state.get("participants", [])
             self.agents = list(participants)
 
-            self._chat(Text("=" * 60, style=BOLD_STYLE))
-            self._chat(Text(f"  OpenParty — Room: {self.room_id}", style=BOLD_STYLE))
-            self._chat(Text(f"  Topic: {topic}", style=DIM_STYLE))
-            if participants:
-                self._chat(Text(f"  Agents: {', '.join(p['name'] for p in participants)}", style=DIM_STYLE))
-            else:
-                self._chat(Text("  Agents: (waiting...)", style=DIM_STYLE))
-            self._chat(Text("=" * 60, style=BOLD_STYLE))
+            self.query_one("#room-header", RoomHeader).update_info(
+                self.room_id, topic, participants
+            )
             if self.owner:
-                self._chat(Text("  You are the room owner. Send a message to set the topic and start.", style=GREEN_STYLE))
+                self._chat(
+                    Text(
+                        "  You are the room owner. Send a message to set the topic and start.",
+                        style=GREEN_STYLE,
+                    )
+                )
             history = msg.get("history", [])
             if history:
-                self._chat(Text(f"  [replaying {len(history)} messages]", style=DIM_STYLE))
+                self._chat(
+                    Text(f"  [replaying {len(history)} messages]", style=DIM_STYLE)
+                )
                 for entry in history:
                     self._print_message(entry)
 
         elif t == "agent_joined":
             agent_st = _agent_style(msg["name"])
-            self._chat(Text(f"{now()}  ++ {msg['name']} ({msg['model']}) joined", style=agent_st))
-            self.agents.append({
-                "agent_id": msg.get("agent_id", msg["name"]),
-                "name": msg["name"],
-                "model": msg.get("model", ""),
-            })
+            self._chat(
+                Text(
+                    f"{now()}  ++ {msg['name']} ({msg['model']}) joined", style=agent_st
+                )
+            )
+            self.agents.append(
+                {
+                    "agent_id": msg.get("agent_id", msg["name"]),
+                    "name": msg["name"],
+                    "model": msg.get("model", ""),
+                }
+            )
+            self.query_one("#room-header", RoomHeader).update_info(
+                self.room_id,
+                msg.get("topic", ""),
+                self.agents,
+            )
 
         elif t == "agent_left":
-            self._chat(Text(
-                f"{now()}  -- {msg['name']} left  ({msg.get('agents_remaining', '?')} remaining)",
-                style=RED_STYLE,
-            ))
+            self._chat(
+                Text(
+                    f"{now()}  -- {msg['name']} left  ({msg.get('agents_remaining', '?')} remaining)",
+                    style=RED_STYLE,
+                )
+            )
             self.agents = [a for a in self.agents if a["name"] != msg["name"]]
 
         elif t == "model_updated":
@@ -575,13 +691,17 @@ class OpenPartyApp(App):
                     a["model"] = new_model
                     break
             label = _model_label(new_model)
-            self._chat(Text(f"{now()}  [model] {agent_name} → {label}", style=DIM_STYLE))
+            self._chat(
+                Text(f"{now()}  [model] {agent_name} → {label}", style=DIM_STYLE)
+            )
 
         elif t == "system_message":
             self._chat(Text(f"{now()}  *** {msg.get('text', '')}", style=YELLOW_STYLE))
 
         elif t == "waiting_for_owner":
-            self._chat(Text(f"{now()}  [server] {msg.get('message', '')}", style=DIM_STYLE))
+            self._chat(
+                Text(f"{now()}  [server] {msg.get('message', '')}", style=DIM_STYLE)
+            )
 
         elif t == "turn_start":
             agent_st = _agent_style(msg["name"])
@@ -598,7 +718,11 @@ class OpenPartyApp(App):
             name = msg.get("name", "?")
             model = msg.get("model", "?")
             if msg.get("success"):
-                self._chat(Text(f"{now()}  [server] 已啟動 {name} ({model})", style=GREEN_STYLE))
+                self._chat(
+                    Text(
+                        f"{now()}  [server] 已啟動 {name} ({model})", style=GREEN_STYLE
+                    )
+                )
             else:
                 self._chat(Text(f"{now()}  [server] 啟動 {name} 失敗", style=RED_STYLE))
 
@@ -680,7 +804,7 @@ class OpenPartyApp(App):
                 inp.cursor_position = len(inp.value)
             else:
                 inp.value = ""
-                asyncio.create_task(self._handle_command(selected.strip()))
+                self.run_worker(self._handle_command(selected.strip()), exclusive=False)
 
     def _completion_tab(self) -> None:
         cl = self.query_one(CompletionList)
@@ -716,10 +840,12 @@ class OpenPartyApp(App):
             self._chat(Text(f"{now()}  [system] 正在讀取可用模型...", style=DIM_STYLE))
             models = await _fetch_models(self.available_engines)
             if not models:
-                self._chat(Text(
-                    f"{now()}  [system] 沒有可用的 engine（server 未偵測到 opencode 或 claude）",
-                    style=RED_STYLE,
-                ))
+                self._chat(
+                    Text(
+                        f"{now()}  [system] 沒有可用的 engine（server 未偵測到 opencode 或 claude）",
+                        style=RED_STYLE,
+                    )
+                )
                 return
             chosen = await self.push_screen_wait(ModelPickerScreen(models))
             if chosen is None:
@@ -733,61 +859,86 @@ class OpenPartyApp(App):
                 while f"{base}-{n}" in existing_names:
                     n += 1
                 agent_name = f"{base}-{n}"
-            self._chat(Text(
-                f"{now()}  [spawning] {chosen['display']} as '{agent_name}'...",
-                style=GREEN_STYLE,
-            ))
+            self._chat(
+                Text(
+                    f"{now()}  [spawning] {chosen['display']} as '{agent_name}'...",
+                    style=GREEN_STYLE,
+                )
+            )
             if self.ws is not None:
-                await self.ws.send(json.dumps({
-                    "type": "spawn_agent",
-                    "name": agent_name,
-                    "model": chosen["full_id"],
-                    "engine": chosen.get("engine", "opencode"),
-                }))
+                await self.ws.send(
+                    json.dumps(
+                        {
+                            "type": "spawn_agent",
+                            "name": agent_name,
+                            "model": chosen["full_id"],
+                            "engine": chosen.get("engine", "opencode"),
+                        }
+                    )
+                )
             return
 
         if text == "/kick-all":
             if not self.agents:
-                self._chat(Text(f"{now()}  [system] 目前沒有成員可踢除", style=YELLOW_STYLE))
+                self._chat(
+                    Text(f"{now()}  [system] 目前沒有成員可踢除", style=YELLOW_STYLE)
+                )
             else:
                 if self.ws is not None:
                     for agent in list(self.agents):
-                        await self.ws.send(json.dumps({
-                            "type": "kick_agent",
-                            "agent_name": agent["name"],
-                        }))
+                        await self.ws.send(
+                            json.dumps(
+                                {
+                                    "type": "kick_agent",
+                                    "agent_name": agent["name"],
+                                }
+                            )
+                        )
             return
 
         if text == "/kick":
             if not self.agents:
-                self._chat(Text(f"{now()}  [system] 目前沒有成員可踢除", style=YELLOW_STYLE))
+                self._chat(
+                    Text(f"{now()}  [system] 目前沒有成員可踢除", style=YELLOW_STYLE)
+                )
                 return
             kick_agents = [
-                {"display": f"{a['name']}  ({a.get('model', '?')})", "agent_name": a["name"]}
-                for a in self.agents
+                {"name": a["name"], "model": a.get("model", "?")} for a in self.agents
             ]
             chosen = await self.push_screen_wait(KickPickerScreen(kick_agents))
             if chosen is None:
                 return
             if self.ws is not None:
-                await self.ws.send(json.dumps({
-                    "type": "kick_agent",
-                    "agent_name": chosen["agent_name"],
-                }))
+                await self.ws.send(
+                    json.dumps(
+                        {
+                            "type": "kick_agent",
+                            "agent_name": chosen["name"],
+                        }
+                    )
+                )
             return
 
         if text.startswith("/broadcast"):
-            content = text[len("/broadcast"):].strip()
+            content = text[len("/broadcast") :].strip()
             if not content:
-                self._chat(Text(f"{now()}  [system] 用法：/broadcast <訊息>", style=YELLOW_STYLE))
+                self._chat(
+                    Text(
+                        f"{now()}  [system] 用法：/broadcast <訊息>", style=YELLOW_STYLE
+                    )
+                )
             elif not self.agents:
-                self._chat(Text(
-                    f"{now()}  [system] 沒有 agent 可以廣播，請先 /add-agent",
-                    style=YELLOW_STYLE,
-                ))
+                self._chat(
+                    Text(
+                        f"{now()}  [system] 沒有 agent 可以廣播，請先 /add-agent",
+                        style=YELLOW_STYLE,
+                    )
+                )
             else:
                 if self.ws is not None:
-                    await self.ws.send(json.dumps({"type": "broadcast", "content": content}))
+                    await self.ws.send(
+                        json.dumps({"type": "broadcast", "content": content})
+                    )
             return
 
         # Normal message
@@ -796,6 +947,7 @@ class OpenPartyApp(App):
 
 
 # ── Model fetching (top-level async) ──────────────────────────────────────────
+
 
 async def _fetch_models(available_engines: list[str]) -> list[dict]:
     """Build agent list based on what the server has available."""
@@ -821,40 +973,51 @@ async def _fetch_models(available_engines: list[str]) -> list[dict]:
                     mid = m.get("id", "")
                     mname = m.get("name", mid)
                     base_name = mid.split("/")[-1].split(":")[0] if mid else "agent"
-                    result.append({
-                        "display": f"{pid} - {mname}",
-                        "full_id": f"{pid}/{mid}",
-                        "engine": "opencode",
-                        "base_name": base_name[:12],
-                    })
+                    result.append(
+                        {
+                            "display": f"{pid} - {mname}",
+                            "full_id": f"{pid}/{mid}",
+                            "engine": "opencode",
+                            "base_name": base_name[:12],
+                        }
+                    )
         except Exception:
             pass
 
     # Claude engine (claude_agent_sdk bundled binary)
     if "claude" in available_engines:
         for model_id, label, base in [
-            ("claude-opus-4-6",   "Opus 4.6  · Most capable",      "claude-opus"),
+            ("claude-opus-4-6", "Opus 4.6  · Most capable", "claude-opus"),
             ("claude-sonnet-4-6", "Sonnet 4.6 · Best for everyday", "claude-sonnet"),
-            ("claude-haiku-4-5",  "Haiku 4.5  · Fastest",           "claude-haiku"),
+            ("claude-haiku-4-5", "Haiku 4.5  · Fastest", "claude-haiku"),
         ]:
-            result.append({
-                "display": f"claude - {label}",
-                "full_id": f"claude/{model_id}",
-                "engine": "claude",
-                "base_name": base,
-            })
+            result.append(
+                {
+                    "display": f"claude - {label}",
+                    "full_id": f"claude/{model_id}",
+                    "engine": "claude",
+                    "base_name": base,
+                }
+            )
 
     return result
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OpenParty TUI — Textual-based room client")
-    parser.add_argument("--room",   default="debate-001",       help="Room ID to join")
-    parser.add_argument("--server", default=OPENPARTY_SERVER,   help="Server WebSocket URL")
-    parser.add_argument("--name",   default="Human",            help="Your display name")
-    parser.add_argument("--owner",  action="store_true",        help="Join as room owner (can speak)")
+    parser = argparse.ArgumentParser(
+        description="OpenParty TUI — Textual-based room client"
+    )
+    parser.add_argument("--room", default="debate-001", help="Room ID to join")
+    parser.add_argument(
+        "--server", default=OPENPARTY_SERVER, help="Server WebSocket URL"
+    )
+    parser.add_argument("--name", default="Human", help="Your display name")
+    parser.add_argument(
+        "--owner", action="store_true", help="Join as room owner (can speak)"
+    )
     args = parser.parse_args()
 
     app = OpenPartyApp(

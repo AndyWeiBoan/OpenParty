@@ -55,7 +55,9 @@ async def ensure_opencode_server(url: str = OPENCODE_URL) -> bool:
     for attempt in range(2):
         try:
             async with aiohttp.ClientSession() as s:
-                async with s.get(f"{url}/global/health", timeout=aiohttp.ClientTimeout(total=2)) as r:
+                async with s.get(
+                    f"{url}/global/health", timeout=aiohttp.ClientTimeout(total=2)
+                ) as r:
                     if r.status == 200:
                         log.info(f"opencode serve already running at {url}")
                         return True
@@ -65,7 +67,10 @@ async def ensure_opencode_server(url: str = OPENCODE_URL) -> bool:
         if attempt == 0:
             log.info("Starting opencode serve on port 4096...")
             _opencode_server_proc = await asyncio.create_subprocess_exec(
-                "opencode", "serve", "--port", "4096",
+                "opencode",
+                "serve",
+                "--port",
+                "4096",
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -80,7 +85,7 @@ class OpenCodeClient:
 
     def __init__(self, url: str, model: str, name: str):
         self.url = url
-        self.model = model          # e.g. "zen/mimo-v2-pro-free"
+        self.model = model  # e.g. "zen/mimo-v2-pro-free"
         self.name = name
         self.session_id: Optional[str] = None
         self.log = logging.getLogger(f"opencode:{name}")
@@ -115,7 +120,7 @@ class OpenCodeClient:
                 async with http.post(
                     f"{self.url}/session/{self.session_id}/message",
                     json=body,
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    timeout=aiohttp.ClientTimeout(total=300),
                 ) as r:
                     if r.status != 200:
                         text = await r.text()
@@ -156,12 +161,14 @@ class OpenCodeClient:
                 for m in items:
                     mid = m.get("id", "")
                     name = m.get("name", mid)
-                    result.append({
-                        "provider": pid,
-                        "model": mid,
-                        "display": f"{pid} - {name}",
-                        "full_id": f"{pid}/{mid}",
-                    })
+                    result.append(
+                        {
+                            "provider": pid,
+                            "model": mid,
+                            "display": f"{pid} - {name}",
+                            "full_id": f"{pid}/{mid}",
+                        }
+                    )
             return result
         except Exception:
             return []
@@ -169,16 +176,30 @@ class OpenCodeClient:
 
 # ── Exceptions ─────────────────────────────────────────────────────────────────
 
+
 class FatalAgentError(Exception):
     """Non-recoverable provider error (rate limit, auth failure, etc.).
     When raised, the agent should leave the room instead of retrying."""
+
     pass
 
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
-def build_prompt(your_turn_payload: dict, agent_name: str, owner_name: str = "") -> str:
-    """Convert your_turn payload into a prompt for Claude Agent SDK."""
+
+def build_prompt(
+    your_turn_payload: dict,
+    agent_name: str,
+    owner_name: str = "",
+    session_id: str | None = None,
+) -> str:
+    """Convert your_turn payload into a prompt for Claude Agent SDK.
+
+    History strategy:
+    - First turn (no session yet): send last 8 entries so agent has full context on join.
+    - Subsequent turns (session exists): send only the latest entry; prior history is
+      already in the session via resume and does not need to be repeated.
+    """
     history = your_turn_payload.get("history", [])
     context = your_turn_payload.get("context", {})
     prompt_hint = your_turn_payload.get("prompt", "")
@@ -187,8 +208,12 @@ def build_prompt(your_turn_payload: dict, agent_name: str, owner_name: str = "")
     participants = context.get("participants", [])
     total_turns = context.get("total_turns", 0)
 
+    history_window = history[-8:] if session_id is None else history[-1:]
+
     lines = []
-    lines.append(f"You are {agent_name}, participating in a multi-agent discussion room.")
+    lines.append(
+        f"You are {agent_name}, participating in a multi-agent discussion room."
+    )
     lines.append("")
 
     if participants:
@@ -201,9 +226,9 @@ def build_prompt(your_turn_payload: dict, agent_name: str, owner_name: str = "")
     lines.append(f"This is turn #{total_turns + 1}.")
     lines.append("")
 
-    if history:
+    if history_window:
         lines.append("Recent conversation:")
-        for entry in history[-8:]:
+        for entry in history_window:
             speaker = entry.get("name", "?")
             content = entry.get("content", "")
             lines.append(f"  {speaker}: {content}")
@@ -225,13 +250,16 @@ def build_prompt(your_turn_payload: dict, agent_name: str, owner_name: str = "")
         "Other agents' opinions are inputs you may challenge, not authorities to follow.\n"
         "3. Actively identify and call out logical flaws, unsupported claims, or weak reasoning "
         "in what other agents said. Be direct and specific when you disagree.\n"
-        "4. Keep your reply concise (2-4 sentences). Speak confidently as yourself."
+        "4. Keep your reply concise (2-4 sentences). Speak confidently as yourself.\n"
+        "5. You may leave the room at any time by including the exact phrase 'I want leave' in your reply, "
+        "followed by a clear explanation of why you are leaving. Without an explanation, you must stay."
     )
 
     return "\n".join(lines)
 
 
 # ── Bridge ─────────────────────────────────────────────────────────────────────
+
 
 class AgentBridge:
     def __init__(
@@ -270,17 +298,25 @@ class AgentBridge:
                 self.log.error("Cannot start opencode serve — aborting")
                 return
 
-        self.log.info(f"Connecting to {self.server_url} | room={self.room_id} | engine={self.engine}")
+        self.log.info(
+            f"Connecting to {self.server_url} | room={self.room_id} | engine={self.engine}"
+        )
 
-        async with websockets.connect(self.server_url) as ws:
+        async with websockets.connect(
+            self.server_url, ping_interval=60, ping_timeout=300
+        ) as ws:
             # Join room
-            await ws.send(json.dumps({
-                "type": "join",
-                "room_id": self.room_id,
-                "agent_id": self.agent_id,
-                "name": self.name,
-                "model": self.model,
-            }))
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "join",
+                        "room_id": self.room_id,
+                        "agent_id": self.agent_id,
+                        "name": self.name,
+                        "model": self.model,
+                    }
+                )
+            )
 
             # Wait for joined confirmation
             joined_raw = await ws.recv()
@@ -292,10 +328,8 @@ class AgentBridge:
                 self.log.error(f"Unexpected first message: {joined}")
                 return
 
-            turns_done = 0
-
-            # Main loop
-            while turns_done < self.max_turns:
+            # Main loop — no turn limit; agent leaves only by saying "i want leave"
+            while True:
                 self.log.info("Waiting for turn...")
 
                 # Drain messages until we get your_turn
@@ -313,7 +347,13 @@ class AgentBridge:
                         if remaining < 1:
                             self.log.info("No agents left, exiting")
                             return
-                    elif t in ("turn_start", "turn_end", "room_state", "message", "agent_joined"):
+                    elif t in (
+                        "turn_start",
+                        "turn_end",
+                        "room_state",
+                        "message",
+                        "agent_joined",
+                    ):
                         pass  # informational, ignore
                     else:
                         self.log.debug(f"Unhandled msg type: {t}")
@@ -322,11 +362,12 @@ class AgentBridge:
                     self.log.info("WebSocket closed while waiting for turn")
                     break
 
-                turns_done += 1
-                self.log.info(f"My turn! (#{turns_done}/{self.max_turns})")
+                self.log.info("My turn!")
 
                 # Build prompt from your_turn context
-                prompt = build_prompt(your_turn_payload, self.name, self.owner_name)
+                prompt = build_prompt(
+                    your_turn_payload, self.name, self.owner_name, self.session_id
+                )
 
                 # Call the configured engine
                 try:
@@ -338,16 +379,24 @@ class AgentBridge:
                         if actual_model and actual_model != self.model:
                             self.model = actual_model
                             self.log.info(f"Detected actual model: {actual_model}")
-                            await ws.send(json.dumps({
-                                "type": "update_model",
-                                "model": actual_model,
-                            }))
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "update_model",
+                                        "model": actual_model,
+                                    }
+                                )
+                            )
                 except FatalAgentError as e:
                     self.log.error(f"Fatal provider error — leaving room: {e}")
-                    await ws.send(json.dumps({
-                        "type": "message",
-                        "content": f"[{self.name} 已離線：{e}]",
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "message",
+                                "content": f"[{self.name} 已離線：{e}]",
+                            }
+                        )
+                    )
                     await ws.send(json.dumps({"type": "leave"}))
                     return
 
@@ -356,14 +405,29 @@ class AgentBridge:
 
                 self.log.info(f"Sending reply: {reply[:80]}...")
 
-                # Send reply back to room
-                await ws.send(json.dumps({
-                    "type": "message",
-                    "content": reply,
-                }))
+                # Agent self-exit: if reply contains the leave signal, send it then leave
+                if "i want leave" in reply.lower():
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "message",
+                                "content": reply,
+                            }
+                        )
+                    )
+                    self.log.info("Agent requested leave via 'i want leave'")
+                    await ws.send(json.dumps({"type": "leave"}))
+                    return
 
-            self.log.info(f"Reached max_turns ({self.max_turns}), leaving room")
-            await ws.send(json.dumps({"type": "leave"}))
+                # Send reply back to room
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "message",
+                            "content": reply,
+                        }
+                    )
+                )
 
     async def _call_claude(self, prompt: str) -> tuple[str, Optional[str]]:
         """Call Claude Agent SDK and return (result_text, actual_model).
@@ -374,6 +438,7 @@ class AgentBridge:
         Raises FatalAgentError for non-recoverable provider errors
         (rate limit, auth failure) so the caller can leave gracefully.
         """
+
         options = ClaudeAgentOptions(
             allowed_tools=self.allowed_tools,
             permission_mode="bypassPermissions",
@@ -418,13 +483,20 @@ class AgentBridge:
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description="OpenParty Agent Bridge")
     parser.add_argument("--room", required=True, help="Room ID to join")
     parser.add_argument("--name", required=True, help="Display name in the room")
-    parser.add_argument("--model", default="claude", help="Model name shown to participants")
-    parser.add_argument("--server", default="ws://localhost:8765", help="OpenParty server URL")
-    parser.add_argument("--max-turns", type=int, default=10, help="Max turns before leaving")
+    parser.add_argument(
+        "--model", default="claude", help="Model name shown to participants"
+    )
+    parser.add_argument(
+        "--server", default="ws://localhost:8765", help="OpenParty server URL"
+    )
+    parser.add_argument(
+        "--max-turns", type=int, default=10, help="Max turns before leaving"
+    )
     parser.add_argument(
         "--tools",
         default="Read,Edit,Bash,Glob,Grep,WebSearch",
