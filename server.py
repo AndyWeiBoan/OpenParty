@@ -105,6 +105,7 @@ class Room:
     turn_started_at: float = 0.0  # monotonic timestamp when current turn began
     owner_kicked_off: bool = False  # True after owner sends first message
     turn_pending: bool = False  # True while an agent is actively thinking
+    current_round: int = 0  # increments on each owner message; used for history windowing
     round_speakers: set = field(default_factory=set)  # agents who spoke this round
     broadcast_pending: Optional[set] = None  # None = sequential mode; set = agent IDs yet to respond in broadcast
     # Private message support: maps history index → set of agent_ids allowed to see that entry
@@ -113,11 +114,22 @@ class Room:
     current_private_for: Optional[set] = None
 
     def context_window(self, agent_id: Optional[str] = None) -> list[dict]:
-        """Return recent history window, filtering out private entries invisible to agent_id."""
-        window = self.history[-SLIDING_WINDOW_SIZE:]
+        """Return recent history window, filtering out private entries invisible to agent_id.
+
+        Always includes all entries in the current round (so agents who speak
+        later in a sequential turn see earlier replies from the same round),
+        plus enough prior history to fill up to SLIDING_WINDOW_SIZE total.
+        """
+        # Find where the current round starts in history
+        current_round_start = next(
+            (i for i, e in enumerate(self.history) if e.get("round", 0) >= self.current_round),
+            len(self.history),
+        )
+        # Take at least the full current round, extended back to SLIDING_WINDOW_SIZE
+        start_idx = min(current_round_start, max(0, len(self.history) - SLIDING_WINDOW_SIZE))
+        window = self.history[start_idx:]
         if agent_id is None or not self.private_visibility:
             return window
-        start_idx = max(0, len(self.history) - SLIDING_WINDOW_SIZE)
         return [
             entry
             for i, entry in enumerate(window)
@@ -517,12 +529,14 @@ class RoomServer:
                             }))
                             continue
                         timestamp = datetime.now(timezone.utc).isoformat()
+                        room.current_round += 1
                         entry = {
                             "agent_id": observer_id,
                             "name": name,
                             "model": "human",
                             "content": f"[broadcast] {content}",
                             "timestamp": timestamp,
+                            "round": room.current_round,
                         }
                         room.history.append(entry)
                         room.round_speakers = set()
@@ -557,6 +571,8 @@ class RoomServer:
                         ]
                         if private_targets:
                             target = private_targets[0]
+                            room.current_round += 1
+                            entry["round"] = room.current_round
                             hist_idx = len(room.history)
                             room.history.append(entry)
                             room.private_visibility[hist_idx] = {target.agent_id}
@@ -581,6 +597,8 @@ class RoomServer:
                             continue
 
                     # ── Normal (public) message ───────────────────────────────
+                    room.current_round += 1
+                    entry["round"] = room.current_round
                     room.history.append(entry)
                     log.info(f"[{room_id}] [owner] {name}: {content[:80]}")
                     await self._broadcast(room, {"type": "message", **entry})
@@ -690,6 +708,7 @@ class RoomServer:
                         "model": model,
                         "content": content,
                         "timestamp": timestamp,
+                        "round": room.current_round,
                     }
 
                     # Check if this reply is part of a private turn

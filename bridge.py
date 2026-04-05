@@ -196,9 +196,9 @@ def build_prompt(
     """Convert your_turn payload into a prompt for Claude Agent SDK.
 
     History strategy:
-    - First turn (no session yet): send last 8 entries so agent has full context on join.
-    - Subsequent turns (session exists): send only the latest entry; prior history is
-      already in the session via resume and does not need to be repeated.
+    - Server sends the correct round-aware window (previous round + current round so far).
+      No truncation needed here — use the full window as-is so every agent sees all
+      messages from the current discussion round regardless of speaking order.
     """
     history = your_turn_payload.get("history", [])
     context = your_turn_payload.get("context", {})
@@ -208,7 +208,7 @@ def build_prompt(
     participants = context.get("participants", [])
     total_turns = context.get("total_turns", 0)
 
-    history_window = history[-8:] if session_id is None else history[-1:]
+    history_window = history
 
     lines = []
     lines.append(

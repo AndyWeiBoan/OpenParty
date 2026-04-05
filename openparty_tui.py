@@ -20,7 +20,7 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, RichLog, Static
@@ -178,66 +178,43 @@ class RoomHeader(Static):
         parts = []
         for a in agents:
             name = a["name"]
+            engine = a.get("engine", "")
+            model = a.get("model", "")
+            if engine and model:
+                label = f"{engine}/{model}"
+            elif model:
+                label = model
+            else:
+                label = name
             if name in thinking:
                 spin = self.SPINNER[frame % len(self.SPINNER)]
-                parts.append(f"{name}[{spin} thinking]")
+                parts.append(f"{label} {spin}")
             else:
-                parts.append(f"{name}[idle]")
-        agent_str = ", ".join(parts) if parts else "(waiting...)"
+                parts.append(f"{label} ●")
+        agent_str = " | ".join(parts) if parts else "(waiting...)"
         self.update(
             f"OpenParty — Room: {room_id}   Topic: {topic}\nAgents: {agent_str}"
         )
 
 
-class ThinkingBar(Static):
-    """Animated spinner shown while an agent is thinking."""
+class AgentSidebar(Static):
+    """Right-side panel showing identity and per-agent thinking state.
+
+    Styled like OpenCode's right sidebar: fixed width, dark background,
+    always visible. Shows owner/observer identity at top, then live
+    thinking status for each active agent below.
+    """
 
     SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     DEFAULT_CSS = """
-    ThinkingBar {
-        height: 1;
-        width: 100%;
-        background: #0a1a0a;
-        color: #ffaa00;
-        padding: 0 1;
-        display: none;
-    }
-    """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._frame = 0
-        self._agent_name = ""
-        self._timer: Timer | None = None
-
-    def start(self, agent_name: str) -> None:
-        self._agent_name = agent_name
-        self._frame = 0
-        self.display = True
-        self._timer = self.set_interval(0.1, self._tick)
-
-    def stop(self) -> None:
-        if self._timer:
-            self._timer.stop()
-            self._timer = None
-        self.display = False
-
-    def _tick(self) -> None:
-        frame = self.SPINNER_FRAMES[self._frame % len(self.SPINNER_FRAMES)]
-        self.update(f"{frame} {self._agent_name} is thinking...")
-        self._frame += 1
-
-
-class SepBar(Static):
-    """Status bar showing owner name or observer read-only notice."""
-
-    DEFAULT_CSS = """
-    SepBar {
-        height: 1;
-        background: white;
-        color: black;
-        padding: 0;
+    AgentSidebar {
+        width: 28;
+        height: 100%;
+        background: #111111;
+        color: #aaaaaa;
+        border-left: solid #333333;
+        padding: 1 1;
     }
     """
 
@@ -245,12 +222,52 @@ class SepBar(Static):
         super().__init__(**kwargs)
         self._owner = owner
         self._name = name
+        self._frame = 0
+        self._thinking_agents: dict[str, str] = {}  # name → last block summary
+        self._timer: Timer | None = None
 
     def on_mount(self) -> None:
+        self._render()
+
+    def start_thinking(self, agent_name: str, summary: str = "") -> None:
+        self._thinking_agents[agent_name] = summary
+        if not self._timer:
+            self._timer = self.set_interval(0.1, self._tick)
+
+    def stop_thinking(self, agent_name: str) -> None:
+        self._thinking_agents.pop(agent_name, None)
+        if not self._thinking_agents and self._timer:
+            self._timer.stop()
+            self._timer = None
+        self._render()
+
+    def _tick(self) -> None:
+        self._frame += 1
+        self._render()
+
+    def _render(self) -> None:
+        lines: list[str] = []
+        # Identity header
         if self._owner:
-            self.update(f" {self._name}  Type message + Enter to send. /leave to exit.")
+            lines.append(f"[bold white]{self._name}[/bold white]")
+            lines.append("[dim]owner[/dim]")
         else:
-            self.update(f" Observer: {self._name}  Read-only mode.")
+            lines.append(f"[bold white]{self._name}[/bold white]")
+            lines.append("[dim]observer[/dim]")
+        lines.append("")
+        # Thinking agents
+        if self._thinking_agents:
+            lines.append("[dim]thinking[/dim]")
+            spin = self.SPINNER_FRAMES[self._frame % len(self.SPINNER_FRAMES)]
+            for agent, summary in self._thinking_agents.items():
+                if summary:
+                    lines.append(f"{spin} [yellow]{agent}[/yellow]")
+                    lines.append(f"  [dim]{summary[:22]}[/dim]")
+                else:
+                    lines.append(f"{spin} [yellow]{agent}[/yellow]")
+        else:
+            lines.append("[dim]idle[/dim]")
+        self.update("\n".join(lines))
 
 
 class CompletionList(Static):
@@ -320,6 +337,22 @@ class CompletionList(Static):
                 else:
                     lines.append(f"[dim]   {escaped_value:<22} {escaped_desc}[/dim]")
         self.update("\n".join(lines))
+
+
+class StatusBar(Static):
+    """Thin status bar showing role and display name, styled via SepBar CSS."""
+
+    DEFAULT_CSS = """
+    StatusBar {
+        height: 1;
+        background: #ffaa00;
+        color: #0a1a0a;
+    }
+    """
+
+    def __init__(self, owner: bool, display_name: str, **kwargs):
+        role = "owner" if owner else "agent"
+        super().__init__(f" {role} · {display_name}", **kwargs)
 
 
 class MessageInput(Input):
@@ -524,6 +557,10 @@ class OpenPartyApp(App):
         self.ws = None
         self.agents: list[dict] = []
         self.available_engines: list[str] = []
+        self._thinking: set[str] = set()
+        self._topic: str = ""
+        self._header_frame: int = 0
+        self._header_timer: Timer | None = None
 
         # Completion state
         self._completing: bool = False
@@ -538,15 +575,32 @@ class OpenPartyApp(App):
         yield RoomHeader(id="room-header")
         yield ChatLog(id="chat")
         yield CompletionList()
-        yield ThinkingBar(id="thinking-bar")
-        yield SepBar(self.owner, self.display_name)
+        yield StatusBar(self.owner, self.display_name, id="status-bar")
         if self.owner:
             yield MessageInput(placeholder="> ", id="input")
 
     def on_mount(self) -> None:
         if self.owner:
             self.query_one("#input", MessageInput).focus()
+        self._header_timer = self.set_interval(0.1, self._tick_header)
         asyncio.create_task(self._run_ws())
+
+    def _tick_header(self) -> None:
+        """Advance spinner frame and refresh header (only when agents are thinking)."""
+        if not self._thinking:
+            return
+        self._header_frame += 1
+        self._refresh_header()
+
+    def _refresh_header(self) -> None:
+        """Update the room header with current thinking state."""
+        self.query_one("#room-header", RoomHeader).update_info(
+            self.room_id,
+            self._topic,
+            self.agents,
+            thinking=self._thinking,
+            frame=self._header_frame,
+        )
 
     # ── WebSocket connection ───────────────────────────────────────────────────
 
@@ -635,10 +689,8 @@ class OpenPartyApp(App):
             topic = state.get("topic", "(waiting for owner to set topic)")
             participants = state.get("participants", [])
             self.agents = list(participants)
-
-            self.query_one("#room-header", RoomHeader).update_info(
-                self.room_id, topic, participants
-            )
+            self._topic = topic
+            self._refresh_header()
             if self.owner:
                 self._chat(
                     Text(
@@ -666,13 +718,11 @@ class OpenPartyApp(App):
                     "agent_id": msg.get("agent_id", msg["name"]),
                     "name": msg["name"],
                     "model": msg.get("model", ""),
+                    "engine": msg.get("engine", ""),
                 }
             )
-            self.query_one("#room-header", RoomHeader).update_info(
-                self.room_id,
-                msg.get("topic", ""),
-                self.agents,
-            )
+            self._topic = msg.get("topic", "") or self._topic
+            self._refresh_header()
 
         elif t == "agent_left":
             self._chat(
@@ -682,6 +732,8 @@ class OpenPartyApp(App):
                 )
             )
             self.agents = [a for a in self.agents if a["name"] != msg["name"]]
+            self._thinking.discard(msg["name"])
+            self._refresh_header()
 
         elif t == "model_updated":
             agent_name = msg.get("name", "")
@@ -706,10 +758,16 @@ class OpenPartyApp(App):
         elif t == "turn_start":
             agent_st = _agent_style(msg["name"])
             self._chat(Text(f"{now()}  » {msg['name']} is thinking...", style=agent_st))
+            self._thinking.add(msg["name"])
+            self._refresh_header()
 
         elif t == "turn_end":
             latency = msg.get("latency_ms", 0)
             self._chat(Text(f"  ({latency}ms)", style=DIM_STYLE))
+            agent_name = msg.get("name", "")
+            if agent_name:
+                self._thinking.discard(agent_name)
+            self._refresh_header()
 
         elif t == "message":
             self._print_message(msg)
