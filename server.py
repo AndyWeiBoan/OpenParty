@@ -112,6 +112,7 @@ class Room:
     private_visibility: dict = field(default_factory=dict)
     # Set to the target agent_id(s) while a private turn is in progress; None otherwise
     current_private_for: Optional[set] = None
+    thinking_log: dict[str, list[dict]] = field(default_factory=dict)
 
     def context_window(self, agent_id: Optional[str] = None) -> list[dict]:
         """Return recent history window, filtering out private entries invisible to agent_id.
@@ -683,6 +684,22 @@ class RoomServer:
             async for raw_msg in ws:
                 msg = json.loads(raw_msg)
 
+                if msg["type"] == "agent_thinking":
+                    # Server adds the authoritative turn number
+                    msg["turn"] = room.current_round
+                    # Store in thinking_log with FIFO (max 20 entries per agent)
+                    agent_log = room.thinking_log.setdefault(agent_id, [])
+                    agent_log.append({
+                        "turn": room.current_round,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "blocks": msg.get("blocks", []),
+                    })
+                    if len(agent_log) > 20:
+                        agent_log.pop(0)
+                    # Broadcast to observers only (agents must NOT see each other's thinking)
+                    await self._broadcast(room, msg, observers_only=True)
+                    continue
+
                 if msg["type"] == "update_model":
                     new_model = msg.get("model", "").strip()
                     if new_model and new_model != agent.model:
@@ -719,7 +736,7 @@ class RoomServer:
 
                     hist_idx = len(room.history)
                     room.history.append(entry)
-                    if is_private_reply:
+                    if is_private_reply and room.current_private_for is not None:
                         room.private_visibility[hist_idx] = room.current_private_for.copy()
                         room.current_private_for = None
 

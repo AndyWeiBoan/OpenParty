@@ -28,6 +28,7 @@ import websockets
 from claude_agent_sdk import ClaudeAgentOptions, query
 from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
 from claude_agent_sdk import ThinkingConfigEnabled
+from claude_agent_sdk import ThinkingBlock, TextBlock, ToolUseBlock
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,23 +99,19 @@ class OpenCodeClient:
                 self.log.info(f"OpenCode session created: {sid}")
                 return sid
 
-    async def call(self, prompt: str) -> str:
-        """Send prompt to opencode serve, return final text reply."""
-        if not self.session_id:
-            self.session_id = await self.create_session()
-
+    def _build_body(self, prompt: str) -> dict:
         body: dict = {
             "parts": [{"type": "text", "text": prompt}],
         }
         if self.model:
-            # API expects model as object: {providerID, modelID}
-            # self.model is in "provider/modelID" format
             parts = self.model.split("/", 1)
             if len(parts) == 2:
                 body["model"] = {"providerID": parts[0], "modelID": parts[1]}
             else:
                 body["model"] = {"providerID": "opencode", "modelID": self.model}
+        return body
 
+    async def _post_message(self, body: dict) -> str:
         try:
             async with aiohttp.ClientSession() as http:
                 async with http.post(
@@ -139,6 +136,13 @@ class OpenCodeClient:
         except Exception as e:
             self.log.error(f"OpenCode call failed: {e}", exc_info=True)
             return f"(opencode error: {e})"
+
+    async def call(self, prompt: str) -> str:
+        """Send prompt to opencode serve, return final text reply."""
+        if not self.session_id:
+            self.session_id = await self.create_session()
+        body = self._build_body(prompt)
+        return await self._post_message(body)
 
     @staticmethod
     async def list_models(url: str = OPENCODE_URL) -> list[dict]:
@@ -291,9 +295,11 @@ class AgentBridge:
         self._opencode: Optional[OpenCodeClient] = None
         if engine == "opencode":
             self._opencode = OpenCodeClient(opencode_url, opencode_model, name)
+        self.ws = None  # set in run() after WS connects
 
     async def run(self):
         if self.engine == "opencode":
+            assert self._opencode is not None
             self.log.info("Ensuring opencode serve is running...")
             ok = await ensure_opencode_server(self._opencode.url)
             if not ok:
@@ -307,6 +313,7 @@ class AgentBridge:
         async with websockets.connect(
             self.server_url, ping_interval=60, ping_timeout=300
         ) as ws:
+            self.ws = ws
             # Join room
             await ws.send(
                 json.dumps(
@@ -374,7 +381,11 @@ class AgentBridge:
                 # Call the configured engine
                 try:
                     if self.engine == "opencode":
-                        reply = await self._opencode.call(prompt)
+                        assert self._opencode is not None
+                        if self.ws is not None:
+                            reply = await self._call_opencode_with_thinking(prompt)
+                        else:
+                            reply = await self._opencode.call(prompt)
                     else:
                         reply, actual_model = await self._call_claude(prompt)
                         # On first response, announce the real model version to the server
@@ -406,7 +417,11 @@ class AgentBridge:
                     self.log.warning("Empty reply from engine, retrying once...")
                     try:
                         if self.engine == "opencode":
-                            reply = await self._opencode.call(prompt)
+                            assert self._opencode is not None
+                            if self.ws is not None:
+                                reply = await self._call_opencode_with_thinking(prompt)
+                            else:
+                                reply = await self._opencode.call(prompt)
                         else:
                             reply, _ = await self._call_claude(prompt)
                     except FatalAgentError:
@@ -443,6 +458,129 @@ class AgentBridge:
                     )
                 )
 
+        self.ws = None
+
+    async def _send_agent_thinking(self, blocks: list[dict]) -> None:
+        """Send agent_thinking event over WebSocket (fire-and-forget)."""
+        if not self.ws or not blocks:
+            return
+        event = {
+            "type": "agent_thinking",
+            "agent_id": self.agent_id,
+            "name": self.name,
+            "blocks": blocks,
+        }
+        try:
+            await self.ws.send(json.dumps(event))
+        except Exception as e:
+            self.log.debug(f"agent_thinking send failed: {e}")
+
+    async def _call_opencode_with_thinking(self, prompt: str) -> str:
+        """Call OpenCode with concurrent SSE thinking stream."""
+        assert self._opencode is not None
+        oc = self._opencode
+        if not oc.session_id:
+            oc.session_id = await oc.create_session()
+
+        body = oc._build_body(prompt)
+
+        post_task = asyncio.create_task(oc._post_message(body))
+        sse_task = asyncio.create_task(self._opencode_sse_listener(post_task))
+
+        try:
+            reply = await post_task
+        finally:
+            sse_task.cancel()
+            await asyncio.gather(sse_task, return_exceptions=True)
+
+        return reply
+
+    async def _opencode_sse_listener(self, done_task: asyncio.Task) -> None:
+        """Subscribe to OpenCode SSE stream and emit agent_thinking events."""
+        assert self._opencode is not None
+        oc = self._opencode
+        reasoning_buf: list[str] = []
+        text_buf: list[str] = []
+
+        try:
+            async with aiohttp.ClientSession() as http:
+                async with http.get(
+                    f"{oc.url}/event",
+                    timeout=aiohttp.ClientTimeout(total=310),
+                    headers={"Accept": "text/event-stream"},
+                ) as resp:
+                    async for raw_line in resp.content:
+                        if done_task.done():
+                            break
+
+                        line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                        if not line.startswith("data:"):
+                            continue
+
+                        payload = line[5:].strip()
+                        if not payload:
+                            continue
+                        try:
+                            data = json.loads(payload)
+                        except Exception:
+                            continue
+
+                        props = data.get("properties", {})
+                        # Filter by session
+                        if props.get("sessionID") != oc.session_id:
+                            continue
+
+                        event_type = data.get("type", "")
+                        field = props.get("field", "")
+                        delta = props.get("delta", "")
+
+                        # message.part.delta with field=reasoning → accumulate
+                        if event_type == "message.part.delta" and field == "reasoning":
+                            reasoning_buf.append(delta)
+
+                        # reasoning-delta (alternative format)
+                        elif event_type == "reasoning-delta":
+                            reasoning_buf.append(delta)
+
+                        # reasoning-end → flush as thinking block
+                        elif event_type in ("reasoning-end",) or (
+                            event_type == "message.part.stop" and field == "reasoning"
+                        ):
+                            if reasoning_buf:
+                                text = "".join(reasoning_buf)
+                                reasoning_buf = []
+                                await self._send_agent_thinking(
+                                    [{"type": "thinking", "text": text}]
+                                )
+
+                        # tool-call → emit immediately
+                        elif event_type == "tool-call":
+                            tool_name = props.get("tool", props.get("name", "tool"))
+                            tool_input = props.get("input", {})
+                            if isinstance(tool_input, str):
+                                try:
+                                    tool_input = json.loads(tool_input)
+                                except Exception:
+                                    tool_input = {"raw": tool_input}
+                            await self._send_agent_thinking(
+                                [{"type": "tool_use", "tool": tool_name, "input": tool_input}]
+                            )
+
+                        # text-delta: accumulate but don't emit (final text from POST)
+                        elif event_type in ("text-delta",) or (
+                            event_type == "message.part.delta" and field == "text"
+                        ):
+                            text_buf.append(delta)
+
+                        # text-end: discard (POST is authoritative)
+                        elif event_type in ("text-end", "finish-step"):
+                            text_buf = []
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.log.debug(f"OpenCode SSE listener error: {e}")
+
     async def _call_claude(self, prompt: str) -> tuple[str, Optional[str]]:
         """Call Claude Agent SDK and return (result_text, actual_model).
 
@@ -469,14 +607,26 @@ class AgentBridge:
         try:
             async for message in query(prompt=prompt, options=options):
                 if isinstance(message, SystemMessage):
-                    if hasattr(message, "session_id") and message.session_id:
-                        if self.session_id is None:
-                            self.session_id = message.session_id
-                            self.log.info(f"Session established: {self.session_id}")
+                    sid = getattr(message, "session_id", None)
+                    if sid and self.session_id is None:
+                        self.session_id = sid
+                        self.log.info(f"Session established: {self.session_id}")
 
                 elif isinstance(message, AssistantMessage):
                     if actual_model is None:
                         actual_model = getattr(message, "model", None) or None
+
+                    # Send thinking stream to observers
+                    blocks = []
+                    for block in message.content:
+                        if isinstance(block, ThinkingBlock):
+                            blocks.append({"type": "thinking", "text": block.thinking})
+                        elif isinstance(block, ToolUseBlock):
+                            blocks.append({"type": "tool_use", "tool": block.name, "input": block.input})
+                        elif isinstance(block, TextBlock):
+                            blocks.append({"type": "text", "text": block.text})
+                    if blocks:
+                        await self._send_agent_thinking(blocks)
 
                 elif isinstance(message, ResultMessage):
                     result_text = getattr(message, "result", "") or ""

@@ -227,7 +227,7 @@ class AgentSidebar(Static):
         self._timer: Timer | None = None
 
     def on_mount(self) -> None:
-        self._render()
+        self._refresh_display()
 
     def start_thinking(self, agent_name: str, summary: str = "") -> None:
         self._thinking_agents[agent_name] = summary
@@ -239,13 +239,13 @@ class AgentSidebar(Static):
         if not self._thinking_agents and self._timer:
             self._timer.stop()
             self._timer = None
-        self._render()
+        self._refresh_display()
 
     def _tick(self) -> None:
         self._frame += 1
-        self._render()
+        self._refresh_display()
 
-    def _render(self) -> None:
+    def _refresh_display(self) -> None:
         lines: list[str] = []
         # Identity header
         if self._owner:
@@ -340,7 +340,9 @@ class CompletionList(Static):
 
 
 class StatusBar(Static):
-    """Thin status bar showing role and display name, styled via SepBar CSS."""
+    """One-line status bar: idle mode shows role/name, thinking mode shows agent activity."""
+
+    SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
     DEFAULT_CSS = """
     StatusBar {
@@ -351,8 +353,71 @@ class StatusBar(Static):
     """
 
     def __init__(self, owner: bool, display_name: str, **kwargs):
-        role = "owner" if owner else "agent"
-        super().__init__(f" {role} · {display_name}", **kwargs)
+        super().__init__("", **kwargs)
+        if owner:
+            self._idle_text = f" [owner] {display_name}  Type message + Enter. /leave to exit."
+        else:
+            self._idle_text = f" Observer: {display_name}  Read-only mode."
+        self._is_thinking = False
+        self._agent_name = ""
+        self._summary = ""
+        self._frame = 0
+        self._timer: Timer | None = None
+
+    def on_mount(self) -> None:
+        self._refresh_display()
+
+    def set_thinking(self, agent_name: str) -> None:
+        """Switch to thinking mode for this agent (called on turn_start)."""
+        self._is_thinking = True
+        self._agent_name = agent_name
+        self._summary = ""
+        if not self._timer:
+            self._timer = self.set_interval(0.1, self._tick)
+        self.styles.background = "#0a1a0a"
+        self.styles.color = "#ffaa00"
+        self._refresh_display()
+
+    def update_block(self, agent_name: str, blocks: list[dict]) -> None:
+        """Update summary from latest non-text block in agent_thinking event."""
+        self._agent_name = agent_name
+        for block in reversed(blocks):
+            btype = block.get("type", "")
+            if btype == "thinking":
+                self._summary = "thinking..."
+                break
+            elif btype == "tool_use":
+                tool = block.get("tool", "?")
+                inp = block.get("input", {})
+                first_val = str(next(iter(inp.values()), "")) if inp else ""
+                self._summary = f"→ {tool}({first_val[:20]})"
+                break
+            # text blocks: don't update summary
+        self._refresh_display()
+
+    def set_idle(self) -> None:
+        """Switch back to idle mode (called on turn_end when no agents are thinking)."""
+        self._is_thinking = False
+        self._agent_name = ""
+        self._summary = ""
+        if self._timer:
+            self._timer.stop()
+            self._timer = None
+        self.styles.background = "#ffaa00"
+        self.styles.color = "#0a1a0a"
+        self._refresh_display()
+
+    def _tick(self) -> None:
+        self._frame += 1
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:
+        if self._is_thinking:
+            spin = self.SPINNER[self._frame % len(self.SPINNER)]
+            summary = f" {self._summary}" if self._summary else " thinking..."
+            self.update(f" {spin} {self._agent_name}{summary}")
+        else:
+            self.update(self._idle_text)
 
 
 class MessageInput(Input):
@@ -558,6 +623,7 @@ class OpenPartyApp(App):
         self.agents: list[dict] = []
         self.available_engines: list[str] = []
         self._thinking: set[str] = set()
+        self._turn_complete: set[str] = set()  # agents whose turn has ended; guard for late agent_thinking
         self._topic: str = ""
         self._header_frame: int = 0
         self._header_timer: Timer | None = None
@@ -756,10 +822,13 @@ class OpenPartyApp(App):
             )
 
         elif t == "turn_start":
-            agent_st = _agent_style(msg["name"])
-            self._chat(Text(f"{now()}  » {msg['name']} is thinking...", style=agent_st))
-            self._thinking.add(msg["name"])
+            agent_name = msg["name"]
+            agent_st = _agent_style(agent_name)
+            self._chat(Text(f"{now()}  » {agent_name} is thinking...", style=agent_st))
+            self._thinking.add(agent_name)
+            self._turn_complete.discard(agent_name)  # reset guard for this agent
             self._refresh_header()
+            self.query_one("#status-bar", StatusBar).set_thinking(agent_name)
 
         elif t == "turn_end":
             latency = msg.get("latency_ms", 0)
@@ -767,7 +836,18 @@ class OpenPartyApp(App):
             agent_name = msg.get("name", "")
             if agent_name:
                 self._thinking.discard(agent_name)
+                self._turn_complete.add(agent_name)
             self._refresh_header()
+            if not self._thinking:
+                self.query_one("#status-bar", StatusBar).set_idle()
+
+        elif t == "agent_thinking":
+            agent_name = msg.get("name", "")
+            # Guard: if turn already ended for this agent, discard for UI
+            if agent_name in self._turn_complete:
+                return
+            blocks = msg.get("blocks", [])
+            self.query_one("#status-bar", StatusBar).update_block(agent_name, blocks)
 
         elif t == "message":
             self._print_message(msg)
