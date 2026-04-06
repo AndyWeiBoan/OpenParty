@@ -217,6 +217,16 @@ class RoomHeader(Static):
                 first_val = str(next(iter(inp.values()), "")) if inp else ""
                 self._agent_status[agent_name] = f"{tool}({first_val[:18]})"
                 break
+            elif btype == "tool_result":
+                tool = block.get("tool", "?")
+                result = block.get("result", "")
+                self._agent_status[agent_name] = f"{tool}:done({result[:18]})"
+                break
+            elif btype == "tool_error":
+                tool = block.get("tool", "?")
+                error = block.get("error", "error")
+                self._agent_status[agent_name] = f"{tool}:error({error[:18]})"
+                break
             elif btype == "text":
                 # Text block means the agent is producing its final response
                 self._agent_status[agent_name] = "responding..."
@@ -232,91 +242,24 @@ class RoomHeader(Static):
         self._refresh_display()
 
     def _refresh_display(self) -> None:
+        print(f"[DEBUG] RoomHeader._refresh_display: agents = {self._agents}")  # DEBUG
         spin = self.SPINNER[self._frame % len(self.SPINNER)]
         lines = [f"OpenParty — Room: {self._room_id}   Topic: {self._topic}", "Agents:"]
         if self._agents:
             for a in self._agents:
                 name = a["name"]
+                engine = a.get("engine", "") or ""
+                print(f"[DEBUG] agent={name}, engine='{engine}'")  # DEBUG
+                if not engine:
+                    print(f"[WARNING] Missing engine for agent: {name}")  # DEBUG
+                engine_tag = f" [{engine}]" if engine else ""
                 if name in self._thinking:
                     summary = self._agent_status.get(name, "") or "thinking..."
-                    lines.append(f"   {spin} {name}: {summary}")
+                    lines.append(f"   {spin} {name}{engine_tag}: {summary}")
                 else:
-                    lines.append(f"   ● {name}: standby")
+                    lines.append(f"   ● {name}{engine_tag}: standby")
         else:
             lines.append("   (waiting...)")
-        self.update("\n".join(lines))
-
-
-class AgentSidebar(Static):
-    """Right-side panel showing identity and per-agent thinking state.
-
-    Styled like OpenCode's right sidebar: fixed width, dark background,
-    always visible. Shows owner/observer identity at top, then live
-    thinking status for each active agent below.
-    """
-
-    SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-    DEFAULT_CSS = """
-    AgentSidebar {
-        width: 28;
-        height: 100%;
-        background: #111111;
-        color: #aaaaaa;
-        border-left: solid #333333;
-        padding: 1 1;
-    }
-    """
-
-    def __init__(self, owner: bool, name: str, **kwargs):
-        super().__init__(**kwargs)
-        self._owner = owner
-        self._name = name
-        self._frame = 0
-        self._thinking_agents: dict[str, str] = {}  # name → last block summary
-        self._timer: Timer | None = None
-
-    def on_mount(self) -> None:
-        self._refresh_display()
-
-    def start_thinking(self, agent_name: str, summary: str = "") -> None:
-        self._thinking_agents[agent_name] = summary
-        if not self._timer:
-            self._timer = self.set_interval(0.1, self._tick)
-
-    def stop_thinking(self, agent_name: str) -> None:
-        self._thinking_agents.pop(agent_name, None)
-        if not self._thinking_agents and self._timer:
-            self._timer.stop()
-            self._timer = None
-        self._refresh_display()
-
-    def _tick(self) -> None:
-        self._frame += 1
-        self._refresh_display()
-
-    def _refresh_display(self) -> None:
-        lines: list[str] = []
-        # Identity header
-        if self._owner:
-            lines.append(f"[bold white]{self._name}[/bold white]")
-            lines.append("[dim]owner[/dim]")
-        else:
-            lines.append(f"[bold white]{self._name}[/bold white]")
-            lines.append("[dim]observer[/dim]")
-        lines.append("")
-        # Thinking agents
-        if self._thinking_agents:
-            lines.append("[dim]thinking[/dim]")
-            spin = self.SPINNER_FRAMES[self._frame % len(self.SPINNER_FRAMES)]
-            for agent, summary in self._thinking_agents.items():
-                if summary:
-                    lines.append(f"{spin} [yellow]{agent}[/yellow]")
-                    lines.append(f"  [dim]{summary[:22]}[/dim]")
-                else:
-                    lines.append(f"{spin} [yellow]{agent}[/yellow]")
-        else:
-            lines.append("[dim]idle[/dim]")
         self.update("\n".join(lines))
 
 
@@ -481,9 +424,12 @@ class MessageInput(TextArea):
     def on_key(self, event: events.Key) -> None:
         app: OpenPartyApp = self.app  # type: ignore[assignment]
 
-        # ── Shift+Enter → newline (let TextArea handle it naturally) ─────
+        # ── Shift+Enter → newline (explicitly insert) ─────────────────
         if event.key == "shift+enter":
-            return  # don't intercept; TextArea inserts newline
+            event.prevent_default()
+            event.stop()
+            self.insert("\n")
+            return
 
         # ── Enter (no Shift) → submit ─────────────────────────────────────
         if event.key == "enter":
@@ -619,7 +565,11 @@ class ModelPickerScreen(_PickerScreen):
         lv = self.query_one("#picker-list", ListView)
         lv.clear()
         for item in self.filtered:
-            lv.append(ListItem(Label(rich_escape(item["display"]))))
+            engine = item.get("engine", "")
+            display_with_engine = (
+                f"[{engine}] {item['display']}" if engine else item["display"]
+            )
+            lv.append(ListItem(Label(rich_escape(display_with_engine))))
         title = self.query_one("#picker-title", Static)
         title.update(
             f" 選擇 Agent [{len(self.filtered)}/{len(self.all_items)}]  ↑↓ Enter Esc "
@@ -824,6 +774,7 @@ class OpenPartyApp(App):
             state = msg.get("room_state", {})
             topic = state.get("topic", "(waiting for owner to set topic)")
             participants = state.get("participants", [])
+            print(f"[DEBUG] joined: participants = {participants}")  # DEBUG
             self.agents = list(participants)
             self._topic = topic
             self._refresh_header()
@@ -849,6 +800,7 @@ class OpenPartyApp(App):
                     f"{now()}  ++ {msg['name']} ({msg['model']}) joined", style=agent_st
                 )
             )
+            print(f"[DEBUG] agent_joined: msg = {msg}")  # DEBUG
             self.agents.append(
                 {
                     "agent_id": msg.get("agent_id", msg["name"]),
