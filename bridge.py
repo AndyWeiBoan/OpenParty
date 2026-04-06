@@ -162,7 +162,7 @@ class OpenCodeClient:
                 async with http.post(
                     f"{self.url}/session/{self.session_id}/message",
                     json=body,
-                    timeout=aiohttp.ClientTimeout(total=None, sock_read=600),
+                    timeout=aiohttp.ClientTimeout(total=120, sock_read=120),
                 ) as r:
                     if r.status != 200:
                         text = await r.text()
@@ -549,7 +549,7 @@ class AgentBridge:
         try:
             await self.ws.send(json.dumps(event))
         except Exception as e:
-            self.log.debug(f"agent_thinking send failed: {e}")
+            self.log.warning(f"agent_thinking send failed: {e}")
 
     async def _call_opencode_with_thinking(self, prompt: str) -> str:
         """Call OpenCode with SSE as primary thinking-stream channel.
@@ -629,7 +629,7 @@ class AgentBridge:
         oc = self._opencode
         reasoning_buf: list[str] = []
         text_buf: list[str] = []
-        _SSE_IDLE_AFTER_DONE = 3.0  # seconds of inactivity before early exit
+        _SSE_IDLE_AFTER_DONE = 30.0  # seconds of inactivity before early exit
 
         async def _flush_reasoning() -> None:
             """Flush any accumulated reasoning content as a thinking block."""

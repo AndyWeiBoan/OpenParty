@@ -626,6 +626,9 @@ class RoomServer:
                             "timestamp": timestamp,
                             "round": room.current_round,
                         }
+                        files = owner_msg.get("files")
+                        if files:
+                            entry["files"] = files
                         room.history.append(entry)
                         room.round_speakers = set()
                         if not room.owner_kicked_off:
@@ -649,6 +652,9 @@ class RoomServer:
                         "content": content,
                         "timestamp": timestamp,
                     }
+                    files = owner_msg.get("files")
+                    if files:
+                        entry["files"] = files
 
                     # ── Private message: #mention detected ───────────────────
                     mentions = _MENTION_RE.findall(content)
@@ -1006,8 +1012,25 @@ class RoomServer:
                 ):
                     room.current_private_for = None
 
+                # If agent disconnects while thinking, send turn_end so UI unblocks
+                if room.turn_pending and room.current_speaker == agent.agent_id:
+                    log.warning(
+                        f"Agent {agent.name} disconnected mid-turn — forcing turn_end"
+                    )
+                    await self._broadcast(
+                        room,
+                        {
+                            "type": "turn_end",
+                            "agent_id": agent.agent_id,
+                            "name": agent.name,
+                            "latency_ms": 0,
+                            "aborted": True,
+                        },
+                    )
+                    room.turn_pending = False
+
                 # Reassign turn if the speaker just left (sequential mode only)
-                elif room.current_speaker == agent.agent_id:
+                if room.current_speaker == agent.agent_id:
                     if remaining >= 1:
                         next_agent = next(iter(room.agents.values()))
                         await self._send_your_turn(room, next_agent)

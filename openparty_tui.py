@@ -9,8 +9,11 @@ Usage:
 import asyncio
 import json
 import argparse
+import fnmatch
+import os
 import re
 from datetime import datetime
+from pathlib import Path
 
 import aiohttp
 import websockets
@@ -82,11 +85,11 @@ def now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
-_INLINE_RE = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*|#[\w][\w\-]*|@[\w][\w\-]*)")
+_INLINE_RE = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*|#[\w][\w\-]*|\$[\w][\w\-]*)")
 
 
 def _parse_to_rich(text: str, base_style: Style) -> Text:
-    """Convert **bold**, *italic*, #name (cyan bold), @name (yellow bold) to Rich Text."""
+    """Convert **bold**, *italic*, #name (cyan bold), $name (yellow bold) to Rich Text."""
     result = Text(style=base_style)
     last = 0
     for m in _INLINE_RE.finditer(text):
@@ -101,12 +104,95 @@ def _parse_to_rich(text: str, base_style: Style) -> Text:
             result.append(inner, style=Style(italic=True) + base_style)
         elif full.startswith("#"):
             result.append(full, style=Style(color="cyan", bold=True))
-        else:  # @mention
+        else:  # $mention
             result.append(full, style=Style(color="yellow", bold=True))
         last = m.end()
     if last < len(text):
         result.append(text[last:], style=base_style)
     return result
+
+
+# ── File search helper ─────────────────────────────────────────────────────────
+
+_EXCLUDE_DIRS = {
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".tox",
+    "dist",
+    "build",
+}
+
+
+def _search_files(query: str, root: str) -> list[tuple[str, str]]:
+    """Search files under *root* matching *query* (substring or fnmatch).
+
+    Returns up to 20 ``(display_name, relative_path)`` tuples, where
+    ``display_name`` equals the relative path (so it is also the insertion text).
+    """
+    root_path = Path(root)
+    results: list[tuple[str, str]] = []
+    query_lower = query.lower()
+
+    try:
+        for p in root_path.rglob("*"):
+            # Skip excluded directories anywhere in the path
+            if any(part in _EXCLUDE_DIRS for part in p.parts):
+                continue
+            if not p.is_file():
+                continue
+            name = p.name.lower()
+            rel = str(p.relative_to(root_path))
+            # Match query against file name or relative path
+            if (
+                not query_lower
+                or query_lower in name
+                or query_lower in rel.lower()
+                or fnmatch.fnmatch(name, f"*{query_lower}*")
+            ):
+                results.append((rel, rel))
+                if len(results) >= 20:
+                    break
+    except PermissionError:
+        pass
+
+    # Sort: files whose name starts with query first
+    results.sort(
+        key=lambda t: (not Path(t[0]).name.lower().startswith(query_lower), t[0])
+    )
+    return results[:20]
+
+
+FILE_CONTENT_LIMIT = 100 * 1024  # 100 KB — files larger than this are skipped
+
+
+def _extract_file_attachments(text: str) -> list[dict]:
+    """Scan *text* for @path references and return file contents.
+
+    Returns a list of ``{"path": rel_path, "content": file_content}`` dicts.
+    Only paths that exist on disk and are ≤ FILE_CONTENT_LIMIT bytes are
+    included; unreadable or oversized files are skipped silently.
+    """
+    attachments = []
+    seen: set[str] = set()
+    root = Path(os.getcwd())
+    for match in re.finditer(r"@([^\s@]+)", text):
+        rel = match.group(1)
+        if rel in seen:
+            continue
+        seen.add(rel)
+        candidate = root / rel
+        if candidate.is_file():
+            try:
+                if candidate.stat().st_size > FILE_CONTENT_LIMIT:
+                    continue  # skip oversized files
+                content = candidate.read_text(encoding="utf-8", errors="replace")
+                attachments.append({"path": rel, "content": content})
+            except OSError:
+                pass
+    return attachments
 
 
 # ── Custom Messages ────────────────────────────────────────────────────────────
@@ -320,12 +406,14 @@ class CompletionList(Static):
             if i == self.selected_idx:
                 if self.completing_type == "mention":
                     lines.append(f"[bold cyan]▶ {escaped_value}[/]")
+                elif self.completing_type == "file":
+                    lines.append(f"[bold cyan]▶ {escaped_value}[/]")
                 else:
                     lines.append(
                         f"[bold cyan]▶  {escaped_value:<22} [dim]{escaped_desc}[/dim][/]"
                     )
             else:
-                if self.completing_type == "mention":
+                if self.completing_type in ("mention", "file"):
                     lines.append(f"[dim]{escaped_value}[/dim]")
                 else:
                     lines.append(f"[dim]   {escaped_value:<22} {escaped_desc}[/dim]")
@@ -897,10 +985,13 @@ class OpenPartyApp(App):
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id == "input" and self.owner:
-            # For completion, use only the last line (where the cursor is)
-            buf = event.text_area.text
-            last_line = buf.split("\n")[-1] if buf else ""
-            self._update_completion(last_line)
+            # Use text left of cursor on the cursor's line, so completions work
+            # on any line (not just the last) and ignore text to the right.
+            inp = event.text_area
+            row, col = inp.cursor_location
+            buf = inp.text
+            current_line = buf.split("\n")[row][:col] if buf else ""
+            self._update_completion(current_line)
 
     def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         if event.input.id != "input" or not self.owner:
@@ -919,8 +1010,20 @@ class OpenPartyApp(App):
     def _update_completion(self, buf: str) -> None:
         cl = self.query_one(CompletionList)
 
-        # @/# mention completion
-        at_match = re.search(r"([#@])([\w\-]*)$", buf)
+        # @ file reference completion
+        file_match = re.search(r"@([^\s]*)$", buf)
+        if file_match:
+            partial = file_match.group(1)
+            matches = _search_files(partial, root=os.getcwd())
+            if matches:
+                self._completing = True
+                self._completing_type = "file"
+                self._completion_items = matches
+                cl.show_items(matches, "file")
+                return
+
+        # $/# mention completion
+        at_match = re.search(r"([#$])([\w\-]*)$", buf)
         if at_match:
             sigil = at_match.group(1)
             partial = at_match.group(2).lower()
@@ -959,8 +1062,22 @@ class OpenPartyApp(App):
         self._completing = False
 
         if self._completing_type == "mention":
-            inp.value = re.sub(r"[#@][\w\-]*$", selected + " ", inp.value)
+            inp.value = re.sub(r"[#$][\w\-]*$", selected + " ", inp.value)
             inp.cursor_position = len(inp.value)
+        elif self._completing_type == "file":
+            # Replace @partial in the cursor's line, rebuild full text
+            buf = inp.text
+            lines = buf.split("\n")
+            inp_obj = self.query_one("#input", MessageInput)
+            row, col = inp_obj.cursor_location
+            current_line = lines[row][:col]
+            suffix = lines[row][col:]
+            new_line = re.sub(r"@[^\s]*$", "@" + selected + " ", current_line)
+            lines[row] = new_line + suffix
+            inp.value = "\n".join(lines)
+            # Move cursor to end of inserted path
+            new_col = len(new_line)
+            inp_obj.move_cursor((row, new_col))
         else:
             # Command
             if selected in COMMANDS_WITH_ARGS:
@@ -980,8 +1097,22 @@ class OpenPartyApp(App):
         self._completing = False
 
         if self._completing_type == "mention":
-            inp.value = re.sub(r"[#@][\w\-]*$", selected + " ", inp.value)
+            inp.value = re.sub(r"[#$][\w\-]*$", selected + " ", inp.value)
             inp.cursor_position = len(inp.value)
+        elif self._completing_type == "file":
+            # Replace @partial in the cursor's line, rebuild full text
+            buf = inp.text
+            lines = buf.split("\n")
+            inp_obj = self.query_one("#input", MessageInput)
+            row, col = inp_obj.cursor_location
+            current_line = lines[row][:col]
+            suffix = lines[row][col:]
+            new_line = re.sub(r"@[^\s]*$", "@" + selected + " ", current_line)
+            lines[row] = new_line + suffix
+            inp.value = "\n".join(lines)
+            # Move cursor to end of inserted path
+            new_col = len(new_line)
+            inp_obj.move_cursor((row, new_col))
         else:
             # Always fill (never execute on tab)
             new_val = selected if selected not in COMMANDS_WITH_ARGS else selected + " "
@@ -1107,7 +1238,12 @@ class OpenPartyApp(App):
 
         # Normal message
         if self.ws is not None:
-            await self.ws.send(json.dumps({"type": "message", "content": text}))
+            payload: dict = {"type": "message", "content": text}
+            loop = asyncio.get_event_loop()
+            files = await loop.run_in_executor(None, _extract_file_attachments, text)
+            if files:
+                payload["files"] = files
+            await self.ws.send(json.dumps(payload))
 
 
 # ── Model fetching (top-level async) ──────────────────────────────────────────
