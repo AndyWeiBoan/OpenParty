@@ -23,7 +23,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, ListItem, ListView, RichLog, Static
+from textual.widgets import Input, Label, ListItem, ListView, RichLog, Static, TextArea
 from textual.timer import Timer
 
 
@@ -79,7 +79,7 @@ def _model_label(model: str) -> str:
 
 
 def now() -> str:
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 _INLINE_RE = re.compile(r"(\*\*(.+?)\*\*|\*(.+?)\*|#[\w][\w\-]*|@[\w][\w\-]*)")
@@ -150,7 +150,7 @@ class ChatLog(RichLog):
 
 
 class RoomHeader(Static):
-    """Sticky header pinned at top showing room info."""
+    """Sticky header pinned at top showing room info and per-agent status."""
 
     DEFAULT_CSS = """
     RoomHeader {
@@ -166,35 +166,77 @@ class RoomHeader(Static):
 
     SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
+    def __init__(self, **kwargs):
+        super().__init__("", **kwargs)
+        self._room_id: str = ""
+        self._topic: str = ""
+        self._agents: list = []
+        self._agent_status: dict[str, str] = {}  # agent_name → status summary
+        self._thinking: set[str] = set()
+        self._frame: int = 0
+        self._timer: Timer | None = None
+
     def update_info(
         self,
         room_id: str,
         topic: str,
         agents: list,
-        thinking: set | None = None,
-        frame: int = 0,
     ) -> None:
-        thinking = thinking or set()
-        parts = []
-        for a in agents:
-            name = a["name"]
-            engine = a.get("engine", "")
-            model = a.get("model", "")
-            if engine and model:
-                label = f"{engine}/{model}"
-            elif model:
-                label = model
-            else:
-                label = name
-            if name in thinking:
-                spin = self.SPINNER[frame % len(self.SPINNER)]
-                parts.append(f"{label} {spin}")
-            else:
-                parts.append(f"{label} ●")
-        agent_str = " | ".join(parts) if parts else "(waiting...)"
-        self.update(
-            f"OpenParty — Room: {room_id}   Topic: {topic}\nAgents: {agent_str}"
-        )
+        self._room_id = room_id
+        self._topic = topic
+        self._agents = agents
+        self._refresh_display()
+
+    def start_thinking(self, agent_name: str, summary: str = "") -> None:
+        """Mark agent as thinking and start spinner."""
+        self._thinking.add(agent_name)
+        self._agent_status[agent_name] = summary or "thinking..."
+        if not self._timer:
+            self._timer = self.set_interval(0.1, self._tick)
+        self._refresh_display()
+
+    def stop_thinking(self, agent_name: str) -> None:
+        """Mark agent as standby and stop spinner if no agents are thinking."""
+        self._thinking.discard(agent_name)
+        self._agent_status.pop(agent_name, None)
+        if not self._thinking and self._timer:
+            self._timer.stop()
+            self._timer = None
+        self._refresh_display()
+
+    def update_block(self, agent_name: str, blocks: list[dict]) -> None:
+        """Update per-agent status summary from latest block in agent_thinking event."""
+        for block in reversed(blocks):
+            btype = block.get("type", "")
+            if btype == "thinking":
+                self._agent_status[agent_name] = "thinking..."
+                break
+            elif btype == "tool_use":
+                tool = block.get("tool", "?")
+                inp = block.get("input", {})
+                first_val = str(next(iter(inp.values()), "")) if inp else ""
+                self._agent_status[agent_name] = f"{tool}({first_val[:18]})"
+                break
+        self._refresh_display()
+
+    def _tick(self) -> None:
+        self._frame += 1
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:
+        spin = self.SPINNER[self._frame % len(self.SPINNER)]
+        lines = [f"OpenParty — Room: {self._room_id}   Topic: {self._topic}", "Agents:"]
+        if self._agents:
+            for a in self._agents:
+                name = a["name"]
+                if name in self._thinking:
+                    summary = self._agent_status.get(name, "") or "thinking..."
+                    lines.append(f"   {spin} {name}: {summary}")
+                else:
+                    lines.append(f"   ● {name}: standby")
+        else:
+            lines.append("   (waiting...)")
+        self.update("\n".join(lines))
 
 
 class AgentSidebar(Static):
@@ -340,9 +382,7 @@ class CompletionList(Static):
 
 
 class StatusBar(Static):
-    """One-line status bar: idle mode shows role/name, thinking mode shows agent activity."""
-
-    SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    """One-line status bar showing round status (idle / thinking)."""
 
     DEFAULT_CSS = """
     StatusBar {
@@ -354,84 +394,101 @@ class StatusBar(Static):
 
     def __init__(self, owner: bool, display_name: str, **kwargs):
         super().__init__("", **kwargs)
-        if owner:
-            self._idle_text = f" [owner] {display_name}  Type message + Enter. /leave to exit."
-        else:
-            self._idle_text = f" Observer: {display_name}  Read-only mode."
-        self._is_thinking = False
-        self._agent_name = ""
-        self._summary = ""
-        self._frame = 0
-        self._timer: Timer | None = None
+        self._display_name = display_name
+        self._round: int = 0
+        self._is_thinking: bool = False
 
     def on_mount(self) -> None:
         self._refresh_display()
 
-    def set_thinking(self, agent_name: str) -> None:
-        """Switch to thinking mode for this agent (called on turn_start)."""
-        self._is_thinking = True
-        self._agent_name = agent_name
-        self._summary = ""
-        if not self._timer:
-            self._timer = self.set_interval(0.1, self._tick)
-        self.styles.background = "#0a1a0a"
-        self.styles.color = "#ffaa00"
+    def set_round(self, round_num: int) -> None:
+        """Update the current round number."""
+        self._round = round_num
         self._refresh_display()
 
-    def update_block(self, agent_name: str, blocks: list[dict]) -> None:
-        """Update summary from latest non-text block in agent_thinking event."""
-        self._agent_name = agent_name
-        for block in reversed(blocks):
-            btype = block.get("type", "")
-            if btype == "thinking":
-                self._summary = "thinking..."
-                break
-            elif btype == "tool_use":
-                tool = block.get("tool", "?")
-                inp = block.get("input", {})
-                first_val = str(next(iter(inp.values()), "")) if inp else ""
-                self._summary = f"→ {tool}({first_val[:20]})"
-                break
-            # text blocks: don't update summary
-        self._refresh_display()
-
-    def set_idle(self) -> None:
-        """Switch back to idle mode (called on turn_end when no agents are thinking)."""
-        self._is_thinking = False
-        self._agent_name = ""
-        self._summary = ""
-        if self._timer:
-            self._timer.stop()
-            self._timer = None
-        self.styles.background = "#ffaa00"
-        self.styles.color = "#0a1a0a"
-        self._refresh_display()
-
-    def _tick(self) -> None:
-        self._frame += 1
+    def set_thinking(self, thinking: bool) -> None:
+        """Switch between thinking and idle state."""
+        self._is_thinking = thinking
+        if thinking:
+            self.styles.background = "#0a1a0a"
+            self.styles.color = "#ffaa00"
+        else:
+            self.styles.background = "#ffaa00"
+            self.styles.color = "#0a1a0a"
         self._refresh_display()
 
     def _refresh_display(self) -> None:
-        if self._is_thinking:
-            spin = self.SPINNER[self._frame % len(self.SPINNER)]
-            summary = f" {self._summary}" if self._summary else " thinking..."
-            self.update(f" {spin} {self._agent_name}{summary}")
-        else:
-            self.update(self._idle_text)
+        round_str = f"Round {self._round}" if self._round > 0 else "idle"
+        state = "thinking" if self._is_thinking else "idle"
+        self.update(f" {round_str} / {state}  — {self._display_name}")
 
 
-class MessageInput(Input):
-    """Text input that delegates Tab/Up/Down/Escape to the completion list."""
+class MessageInput(TextArea):
+    """Multi-line text input: Shift+Enter inserts newline, Enter submits."""
 
-    async def action_submit(self) -> None:  # type: ignore[override]
-        app: OpenPartyApp = self.app  # type: ignore[assignment]
-        if getattr(app, "_completing", False):
-            app._completion_enter()
-        else:
-            await super().action_submit()
+    class Submitted(Message):
+        """Emitted when the user presses Enter (without Shift) to submit."""
+
+        def __init__(self, input: "MessageInput", value: str) -> None:
+            super().__init__()
+            self.input = input
+            self.value = value
+
+    # Expose a `.value` property so call-sites that used Input.value still work.
+    @property
+    def value(self) -> str:  # type: ignore[override]
+        return self.text
+
+    @value.setter
+    def value(self, new: str) -> None:
+        self.clear()
+        self.insert(new)
+
+    # Mimic Input.cursor_position setter (move cursor to a character offset).
+    @property
+    def cursor_position(self) -> int:  # type: ignore[override]
+        row, col = self.cursor_location
+        # approximate: count chars up to row,col
+        lines = self.text.split("\n")
+        pos = sum(len(lines[i]) + 1 for i in range(row)) + col
+        return pos
+
+    @cursor_position.setter
+    def cursor_position(self, pos: int) -> None:
+        text = self.text
+        row = 0
+        col = 0
+        count = 0
+        for i, ch in enumerate(text):
+            if count >= pos:
+                break
+            if ch == "\n":
+                row += 1
+                col = 0
+            else:
+                col += 1
+            count += 1
+        self.move_cursor((row, col))
 
     def on_key(self, event: events.Key) -> None:
         app: OpenPartyApp = self.app  # type: ignore[assignment]
+
+        # ── Shift+Enter → newline (let TextArea handle it naturally) ─────
+        if event.key == "shift+enter":
+            return  # don't intercept; TextArea inserts newline
+
+        # ── Enter (no Shift) → submit ─────────────────────────────────────
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            if getattr(app, "_completing", False):
+                app._completion_enter()
+            else:
+                text = self.text
+                self.post_message(self.Submitted(self, text))
+            return
+
+        # ── Completion navigation ─────────────────────────────────────────
         if not getattr(app, "_completing", False):
             return
         if event.key == "up":
@@ -623,10 +680,11 @@ class OpenPartyApp(App):
         self.agents: list[dict] = []
         self.available_engines: list[str] = []
         self._thinking: set[str] = set()
-        self._turn_complete: set[str] = set()  # agents whose turn has ended; guard for late agent_thinking
+        self._turn_complete: set[str] = (
+            set()
+        )  # agents whose turn has ended; guard for late agent_thinking
         self._topic: str = ""
-        self._header_frame: int = 0
-        self._header_timer: Timer | None = None
+        self._last_round: int = 0  # track round changes for divider rendering
 
         # Completion state
         self._completing: bool = False
@@ -641,31 +699,21 @@ class OpenPartyApp(App):
         yield RoomHeader(id="room-header")
         yield ChatLog(id="chat")
         yield CompletionList()
-        yield StatusBar(self.owner, self.display_name, id="status-bar")
+        yield StatusBar(self.owner, self.display_name, id="round-status-bar")
         if self.owner:
-            yield MessageInput(placeholder="> ", id="input")
+            yield MessageInput(id="input")
 
     def on_mount(self) -> None:
         if self.owner:
             self.query_one("#input", MessageInput).focus()
-        self._header_timer = self.set_interval(0.1, self._tick_header)
         asyncio.create_task(self._run_ws())
 
-    def _tick_header(self) -> None:
-        """Advance spinner frame and refresh header (only when agents are thinking)."""
-        if not self._thinking:
-            return
-        self._header_frame += 1
-        self._refresh_header()
-
     def _refresh_header(self) -> None:
-        """Update the room header with current thinking state."""
+        """Update the room header with current agent list and topic."""
         self.query_one("#room-header", RoomHeader).update_info(
             self.room_id,
             self._topic,
             self.agents,
-            thinking=self._thinking,
-            frame=self._header_frame,
         )
 
     # ── WebSocket connection ───────────────────────────────────────────────────
@@ -714,10 +762,24 @@ class OpenPartyApp(App):
         private_to = entry.get("private_to", [])
         is_owner_msg = name.startswith("[owner]")
 
+        # Insert round divider when round number changes
+        msg_round = entry.get("round", 0)
+        if msg_round > self._last_round:
+            width = self.size.width or 80
+            round_label = f" Round {msg_round} "
+            side = max(2, (width - len(round_label)) // 2)
+            divider = "─" * side + round_label + "─" * side
+            if self._last_round > 0:
+                self._chat(Text(divider, style=Style(color="#45505A", bold=True)))
+            self._last_round = msg_round
+
         self._chat(Text(""))
 
         model_label = _model_label(model)
-        header_str = f"  {name}  ({model_label})" if model_label else f"  {name}"
+        ts = now()
+        header_str = (
+            f"  {ts}  {name}  ({model_label})" if model_label else f"  {ts}  {name}"
+        )
 
         if is_private:
             if private_to:
@@ -823,12 +885,12 @@ class OpenPartyApp(App):
 
         elif t == "turn_start":
             agent_name = msg["name"]
-            agent_st = _agent_style(agent_name)
-            self._chat(Text(f"{now()}  » {agent_name} is thinking...", style=agent_st))
             self._thinking.add(agent_name)
             self._turn_complete.discard(agent_name)  # reset guard for this agent
-            self._refresh_header()
-            self.query_one("#status-bar", StatusBar).set_thinking(agent_name)
+            header = self.query_one("#room-header", RoomHeader)
+            header.update_info(self.room_id, self._topic, self.agents)
+            header.start_thinking(agent_name)
+            self.query_one("#round-status-bar", StatusBar).set_thinking(True)
 
         elif t == "turn_end":
             latency = msg.get("latency_ms", 0)
@@ -837,9 +899,9 @@ class OpenPartyApp(App):
             if agent_name:
                 self._thinking.discard(agent_name)
                 self._turn_complete.add(agent_name)
-            self._refresh_header()
+                self.query_one("#room-header", RoomHeader).stop_thinking(agent_name)
             if not self._thinking:
-                self.query_one("#status-bar", StatusBar).set_idle()
+                self.query_one("#round-status-bar", StatusBar).set_thinking(False)
 
         elif t == "agent_thinking":
             agent_name = msg.get("name", "")
@@ -847,7 +909,7 @@ class OpenPartyApp(App):
             if agent_name in self._turn_complete:
                 return
             blocks = msg.get("blocks", [])
-            self.query_one("#status-bar", StatusBar).update_block(agent_name, blocks)
+            self.query_one("#room-header", RoomHeader).update_block(agent_name, blocks)
 
         elif t == "message":
             self._print_message(msg)
@@ -872,11 +934,14 @@ class OpenPartyApp(App):
 
     # ── Input events ───────────────────────────────────────────────────────────
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "input" and self.owner:
-            self._update_completion(event.value)
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id == "input" and self.owner:
+            # For completion, use only the last line (where the cursor is)
+            buf = event.text_area.text
+            last_line = buf.split("\n")[-1] if buf else ""
+            self._update_completion(last_line)
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_message_input_submitted(self, event: MessageInput.Submitted) -> None:
         if event.input.id != "input" or not self.owner:
             return
         text = event.value.strip()

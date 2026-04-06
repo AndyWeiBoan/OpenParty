@@ -26,7 +26,9 @@ SepBar {
 }
 
 MessageInput {
-    height: 3;
+    height: auto;
+    min-height: 3;
+    max-height: 10;
     background: #0a1a0a;
     border: tall #ffaa00;
     padding: 0 1;

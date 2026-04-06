@@ -21,14 +21,58 @@ import json
 import logging
 import sys
 import uuid
+from dataclasses import dataclass, field
 from typing import Optional
 
 import aiohttp
 import websockets
 from claude_agent_sdk import ClaudeAgentOptions, query
 from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
-from claude_agent_sdk import ThinkingConfigEnabled
+from claude_agent_sdk import ThinkingConfigEnabled, ProcessError
 from claude_agent_sdk import ThinkingBlock, TextBlock, ToolUseBlock
+
+# ── Event schema dataclasses ────────────────────────────────────────────────────
+
+
+@dataclass
+class AgentThinkingBlock:
+    """A thinking (reasoning) block inside an AgentThinkingEvent."""
+
+    type: str = "thinking"
+    text: str = ""
+
+
+@dataclass
+class AgentToolUseBlock:
+    """A tool-use block inside an AgentThinkingEvent."""
+
+    type: str = "tool_use"
+    tool: str = ""
+    input: dict = field(default_factory=dict)
+
+
+@dataclass
+class AgentTextBlock:
+    """A text block inside an AgentThinkingEvent."""
+
+    type: str = "text"
+    text: str = ""
+
+
+@dataclass
+class AgentThinkingEvent:
+    """Wire-format schema for the agent_thinking WebSocket event.
+
+    Bridge sends this (without ``turn``); server injects ``turn`` before
+    broadcasting to observers.
+    """
+
+    type: str = "agent_thinking"
+    agent_id: str = ""
+    name: str = ""
+    turn: int = 0
+    blocks: list = field(default_factory=list)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,7 +161,7 @@ class OpenCodeClient:
                 async with http.post(
                     f"{self.url}/session/{self.session_id}/message",
                     json=body,
-                    timeout=aiohttp.ClientTimeout(total=300),
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=600),
                 ) as r:
                     if r.status != 200:
                         text = await r.text()
@@ -341,31 +385,61 @@ class AgentBridge:
             while True:
                 self.log.info("Waiting for turn...")
 
-                # Drain messages until we get your_turn
+                # Drain messages until we get your_turn (with timeout)
+                WAIT_TIMEOUT = 600  # 10 minutes max wait for a turn
                 your_turn_payload = None
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    t = msg.get("type")
 
-                    if t == "your_turn":
-                        your_turn_payload = msg
-                        break
-                    elif t == "agent_left":
-                        remaining = msg.get("agents_remaining", 0)
-                        self.log.info(f"Agent left, {remaining} remaining")
-                        if remaining < 1:
-                            self.log.info("No agents left, exiting")
-                            return
-                    elif t in (
-                        "turn_start",
-                        "turn_end",
-                        "room_state",
-                        "message",
-                        "agent_joined",
-                    ):
-                        pass  # informational, ignore
-                    else:
-                        self.log.debug(f"Unhandled msg type: {t}")
+                async def _drain_until_turn():
+                    nonlocal your_turn_payload
+                    async for raw in ws:
+                        msg = json.loads(raw)
+                        t = msg.get("type")
+
+                        if t == "your_turn":
+                            your_turn_payload = msg
+                            return "got_turn"
+                        elif t == "agent_left":
+                            remaining = msg.get("agents_remaining", 0)
+                            self.log.info(f"Agent left, {remaining} remaining")
+                            if remaining < 1:
+                                self.log.info("No agents left, exiting")
+                                return "exit"
+                        elif t == "waiting_for_owner":
+                            self.log.info(
+                                f"Waiting for owner: {msg.get('message', '')}"
+                            )
+                        elif t == "system_message":
+                            sys_msg = msg.get("message", "")
+                            self.log.info(f"System message: {sys_msg}")
+                            # If we've been kicked, exit gracefully
+                            if "kicked" in sys_msg.lower():
+                                self.log.info("Kicked from room, exiting")
+                                return "exit"
+                        elif t in (
+                            "turn_start",
+                            "turn_end",
+                            "room_state",
+                            "message",
+                            "agent_joined",
+                        ):
+                            pass  # informational, ignore
+                        else:
+                            self.log.debug(f"Unhandled msg type: {t}")
+                    return None  # WebSocket closed
+
+                try:
+                    result = await asyncio.wait_for(
+                        _drain_until_turn(), timeout=WAIT_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    self.log.warning(
+                        f"Timed out after {WAIT_TIMEOUT}s waiting for turn, exiting"
+                    )
+                    break
+
+                if result == "exit":
+                    return
+                # result is None → WS closed, or "got_turn" → continue
 
                 if your_turn_payload is None:
                     self.log.info("WebSocket closed while waiting for turn")
@@ -476,7 +550,25 @@ class AgentBridge:
             self.log.debug(f"agent_thinking send failed: {e}")
 
     async def _call_opencode_with_thinking(self, prompt: str) -> str:
-        """Call OpenCode with concurrent SSE thinking stream."""
+        """Call OpenCode with SSE as primary thinking-stream channel.
+
+        Architecture
+        ------------
+        1. POST the message to OpenCode — this is the authoritative source of
+           the final reply.  It runs concurrently with SSE so we never wait
+           longer than the model itself takes.
+        2. SSE listener is the *primary observable* channel: it emits
+           ``agent_thinking`` events to observers in real-time while the model
+           is generating.  The real listener exits naturally when it detects
+           that ``post_task`` has completed (``done_task.done()`` check).
+        3. Timeout / fallback: if SSE fails to start or stalls beyond
+           ``SSE_TIMEOUT`` seconds *after* POST has already resolved, it is
+           cancelled and treated as a non-fatal error — the POST result is
+           used as the fallback final answer and thinking events are simply
+           unavailable for this turn.
+        """
+        SSE_TIMEOUT = 5  # seconds grace period after POST resolves before we cancel SSE
+
         assert self._opencode is not None
         oc = self._opencode
         if not oc.session_id:
@@ -484,14 +576,30 @@ class AgentBridge:
 
         body = oc._build_body(prompt)
 
+        # Start POST immediately — resolves when OpenCode produces its answer.
         post_task = asyncio.create_task(oc._post_message(body))
+
+        # SSE is the primary thinking-events channel; runs concurrently.
         sse_task = asyncio.create_task(self._opencode_sse_listener(post_task))
 
         try:
             reply = await post_task
         finally:
-            sse_task.cancel()
-            await asyncio.gather(sse_task, return_exceptions=True)
+            # Give SSE a short grace period to flush any buffered events, then
+            # cancel it.  SSE errors here are non-fatal — POST is the fallback.
+            if not sse_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(sse_task), timeout=SSE_TIMEOUT)
+                except asyncio.TimeoutError:
+                    self.log.warning(
+                        "OpenCode SSE listener did not finish after POST — "
+                        "cancelling (POST result used as fallback)"
+                    )
+                    sse_task.cancel()
+                except Exception as e:
+                    self.log.debug(f"SSE listener error after POST (non-fatal): {e}")
+                    sse_task.cancel()
+                await asyncio.gather(sse_task, return_exceptions=True)
 
         return reply
 
@@ -563,7 +671,13 @@ class AgentBridge:
                                 except Exception:
                                     tool_input = {"raw": tool_input}
                             await self._send_agent_thinking(
-                                [{"type": "tool_use", "tool": tool_name, "input": tool_input}]
+                                [
+                                    {
+                                        "type": "tool_use",
+                                        "tool": tool_name,
+                                        "input": tool_input,
+                                    }
+                                ]
                             )
 
                         # text-delta: accumulate but don't emit (final text from POST)
@@ -591,6 +705,9 @@ class AgentBridge:
         (rate limit, auth failure) so the caller can leave gracefully.
         """
 
+        def _stderr_callback(line: str) -> None:
+            self.log.warning(f"[CLI stderr] {line}")
+
         options = ClaudeAgentOptions(
             allowed_tools=self.allowed_tools,
             permission_mode="bypassPermissions",
@@ -598,6 +715,7 @@ class AgentBridge:
             resume=self.session_id,
             max_turns=5,
             thinking=ThinkingConfigEnabled(type="enabled", budget_tokens=8000),
+            stderr=_stderr_callback,
         )
 
         result_text = ""
@@ -622,7 +740,13 @@ class AgentBridge:
                         if isinstance(block, ThinkingBlock):
                             blocks.append({"type": "thinking", "text": block.thinking})
                         elif isinstance(block, ToolUseBlock):
-                            blocks.append({"type": "tool_use", "tool": block.name, "input": block.input})
+                            blocks.append(
+                                {
+                                    "type": "tool_use",
+                                    "tool": block.name,
+                                    "input": block.input,
+                                }
+                            )
                         elif isinstance(block, TextBlock):
                             blocks.append({"type": "text", "text": block.text})
                     if blocks:
@@ -632,11 +756,31 @@ class AgentBridge:
                     result_text = getattr(message, "result", "") or ""
                     result_is_error = bool(getattr(message, "is_error", False))
 
+        except ProcessError as e:
+            exit_code = getattr(e, "exit_code", None)
+            stderr_text = getattr(e, "stderr", None)
+            self.log.error(
+                f"CLI ProcessError: exit_code={exit_code}, "
+                f"stderr={stderr_text!r}, msg={e}, "
+                f"repr={repr(e)}, attrs={e.__dict__}"
+            )
+            if result_text:
+                self.log.warning(
+                    "ProcessError after partial result — returning partial"
+                )
+            else:
+                return (
+                    f"(error: CLI exit {exit_code}: {stderr_text or 'no stderr captured'})",
+                    actual_model,
+                )
         except Exception as e:
             if result_text:
                 self.log.debug(f"SDK post-result exception (ignored): {e}")
             else:
-                self.log.error(f"SDK error: {e}")
+                self.log.error(
+                    f"SDK error: {e}, type={type(e).__name__}, "
+                    f"repr={repr(e)}, attrs={getattr(e, '__dict__', {})}"
+                )
                 return f"(error: {e})", actual_model
 
         if result_is_error and result_text:
