@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
@@ -367,6 +368,7 @@ class AgentBridge:
                         "agent_id": self.agent_id,
                         "name": self.name,
                         "model": self.model,
+                        "engine": self.engine,
                     }
                 )
             )
@@ -619,11 +621,15 @@ class AgentBridge:
           discarded because the POST task finished first.
         - ``reasoning_buf`` is flushed in a ``finally`` block so partial
           thinking content is never silently dropped on cancellation or error.
+        - After ``done_task`` completes, we track the last-event timestamp.  If
+          no new SSE events arrive within ``_SSE_IDLE_AFTER_DONE`` seconds we
+          break early rather than waiting the full ``SSE_TIMEOUT``.
         """
         assert self._opencode is not None
         oc = self._opencode
         reasoning_buf: list[str] = []
         text_buf: list[str] = []
+        _SSE_IDLE_AFTER_DONE = 3.0  # seconds of inactivity before early exit
 
         async def _flush_reasoning() -> None:
             """Flush any accumulated reasoning content as a thinking block."""
@@ -634,6 +640,8 @@ class AgentBridge:
                 await self._send_agent_thinking([{"type": "thinking", "text": text}])
 
         try:
+            _last_event_ts: float = time.monotonic()
+
             async with aiohttp.ClientSession() as http:
                 async with http.get(
                     f"{oc.url}/event",
@@ -643,6 +651,13 @@ class AgentBridge:
                     async for raw_line in resp.content:
                         line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                         if not line.startswith("data:"):
+                            # Still check idle timeout even on non-data lines
+                            if (
+                                done_task.done()
+                                and (time.monotonic() - _last_event_ts)
+                                > _SSE_IDLE_AFTER_DONE
+                            ):
+                                break
                             continue
 
                         payload = line[5:].strip()
@@ -653,6 +668,9 @@ class AgentBridge:
                         except Exception:
                             continue
 
+                        # Update last-event timestamp on every parsed event
+                        _last_event_ts = time.monotonic()
+
                         props = data.get("properties", {})
                         # Filter by session
                         if props.get("sessionID") != oc.session_id:
@@ -662,21 +680,85 @@ class AgentBridge:
                         field = props.get("field", "")
                         delta = props.get("delta", "")
 
-                        # message.part.delta with field=reasoning → accumulate
+                        self.log.debug(f"OpenCode SSE: type={event_type} field={field}")
+
+                        # message.part.delta with field=reasoning → stream immediately
                         if event_type == "message.part.delta" and field == "reasoning":
                             reasoning_buf.append(delta)
+                            await self._send_agent_thinking(
+                                [{"type": "thinking", "text": "".join(reasoning_buf)}]
+                            )
 
-                        # reasoning-delta (alternative format)
+                        # reasoning-delta (alternative format) → stream immediately
                         elif event_type == "reasoning-delta":
                             reasoning_buf.append(delta)
+                            await self._send_agent_thinking(
+                                [{"type": "thinking", "text": "".join(reasoning_buf)}]
+                            )
 
-                        # reasoning-end → flush as thinking block
+                        # reasoning-end → flush as thinking block (final flush)
                         elif event_type in ("reasoning-end",) or (
                             event_type == "message.part.stop" and field == "reasoning"
                         ):
                             await _flush_reasoning()
 
-                        # tool-call → emit immediately as tool_use block
+                        # message.part.updated with ToolPart → map tool
+                        # state to appropriate block types.
+                        # OpenCode sends tool lifecycle as ToolPart objects
+                        # with state.status: pending/running/completed/error
+                        elif event_type == "message.part.updated":
+                            part = props.get("part", {})
+                            if part.get("type") == "tool":
+                                tool_name = part.get("tool", "tool")
+                                state = part.get("state", {})
+                                status = state.get("status", "")
+                                tool_input = state.get("input", {})
+                                if isinstance(tool_input, str):
+                                    try:
+                                        tool_input = json.loads(tool_input)
+                                    except Exception:
+                                        tool_input = {"raw": tool_input}
+
+                                if status in ("pending", "running"):
+                                    # Tool is starting or actively running
+                                    await self._send_agent_thinking(
+                                        [
+                                            {
+                                                "type": "tool_use",
+                                                "tool": tool_name,
+                                                "input": tool_input,
+                                            }
+                                        ]
+                                    )
+                                elif status == "completed":
+                                    output = state.get("output", "")
+                                    result_preview = str(output)[:40] if output else ""
+                                    title = state.get("title", "")
+                                    display = title or result_preview
+                                    await self._send_agent_thinking(
+                                        [
+                                            {
+                                                "type": "tool_result",
+                                                "tool": tool_name,
+                                                "result": display[:40],
+                                            }
+                                        ]
+                                    )
+                                elif status == "error":
+                                    error = state.get("error", "error")
+                                    error_preview = str(error)[:40] if error else "error"
+                                    await self._send_agent_thinking(
+                                        [
+                                            {
+                                                "type": "tool_error",
+                                                "tool": tool_name,
+                                                "error": error_preview,
+                                            }
+                                        ]
+                                    )
+
+                        # Legacy tool events (kept for backward compatibility
+                        # with older OpenCode versions, if any)
                         elif event_type == "tool-call":
                             tool_name = props.get("tool", props.get("name", "tool"))
                             tool_input = props.get("input", {})
@@ -695,48 +777,15 @@ class AgentBridge:
                                 ]
                             )
 
-                        # tool-input-start → show tool name before input arrives
-                        elif event_type == "tool-input-start":
-                            tool_name = props.get("tool", props.get("name", "tool"))
-                            await self._send_agent_thinking(
-                                [{"type": "tool_use", "tool": tool_name, "input": {}}]
-                            )
-
-                        # tool-result → show tool completed with result summary
-                        elif event_type == "tool-result":
-                            tool_name = props.get("tool", props.get("name", "tool"))
-                            result = props.get("result", "")
-                            result_preview = str(result)[:40] if result else ""
-                            await self._send_agent_thinking(
-                                [
-                                    {
-                                        "type": "tool_use",
-                                        "tool": f"{tool_name}:done",
-                                        "input": {"result": result_preview},
-                                    }
-                                ]
-                            )
-
-                        # tool-error → show tool failed
-                        elif event_type == "tool-error":
-                            tool_name = props.get("tool", props.get("name", "tool"))
-                            error = props.get("error", "error")
-                            error_preview = str(error)[:40] if error else "error"
-                            await self._send_agent_thinking(
-                                [
-                                    {
-                                        "type": "tool_use",
-                                        "tool": f"{tool_name}:error",
-                                        "input": {"error": error_preview},
-                                    }
-                                ]
-                            )
-
-                        # text-delta: accumulate but don't emit (final text from POST)
+                        # text-delta: accumulate and emit a "text" block so
+                        # the header shows "responding..." instead of "thinking..."
                         elif event_type in ("text-delta",) or (
                             event_type == "message.part.delta" and field == "text"
                         ):
                             text_buf.append(delta)
+                            await self._send_agent_thinking(
+                                [{"type": "text", "text": "".join(text_buf)}]
+                            )
 
                         # terminal events: flush reasoning and stop draining if POST is done
                         elif event_type in ("text-end", "finish-step", "message.stop"):

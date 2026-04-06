@@ -46,6 +46,7 @@ def _check_claude_installed() -> bool:
     """True if claude_agent_sdk with bundled binary is available."""
     try:
         import claude_agent_sdk
+
         bundled = os.path.join(
             os.path.dirname(claude_agent_sdk.__file__), "_bundled", "claude"
         )
@@ -66,6 +67,7 @@ async def _opencode_healthy() -> bool:
     except Exception:
         return False
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [SERVER] %(message)s",
@@ -83,6 +85,7 @@ class Agent:
     name: str
     model: str
     room_id: str
+    engine: str = ""
 
 
 @dataclass
@@ -105,9 +108,13 @@ class Room:
     turn_started_at: float = 0.0  # monotonic timestamp when current turn began
     owner_kicked_off: bool = False  # True after owner sends first message
     turn_pending: bool = False  # True while an agent is actively thinking
-    current_round: int = 0  # increments on each owner message; used for history windowing
+    current_round: int = (
+        0  # increments on each owner message; used for history windowing
+    )
     round_speakers: set = field(default_factory=set)  # agents who spoke this round
-    broadcast_pending: Optional[set] = None  # None = sequential mode; set = agent IDs yet to respond in broadcast
+    broadcast_pending: Optional[set] = (
+        None  # None = sequential mode; set = agent IDs yet to respond in broadcast
+    )
     # Private message support: maps history index → set of agent_ids allowed to see that entry
     private_visibility: dict = field(default_factory=dict)
     # Set to the target agent_id(s) while a private turn is in progress; None otherwise
@@ -123,11 +130,17 @@ class Room:
         """
         # Find where the current round starts in history
         current_round_start = next(
-            (i for i, e in enumerate(self.history) if e.get("round", 0) >= self.current_round),
+            (
+                i
+                for i, e in enumerate(self.history)
+                if e.get("round", 0) >= self.current_round
+            ),
             len(self.history),
         )
         # Take at least the full current round, extended back to SLIDING_WINDOW_SIZE
-        start_idx = min(current_round_start, max(0, len(self.history) - SLIDING_WINDOW_SIZE))
+        start_idx = min(
+            current_round_start, max(0, len(self.history) - SLIDING_WINDOW_SIZE)
+        )
         window = self.history[start_idx:]
         if agent_id is None or not self.private_visibility:
             return window
@@ -161,7 +174,12 @@ class Room:
             "turn_count": len(self.history),
             "current_speaker": self.current_speaker,
             "participants": [
-                {"agent_id": a.agent_id, "name": a.name, "model": a.model}
+                {
+                    "agent_id": a.agent_id,
+                    "name": a.name,
+                    "model": a.model,
+                    "engine": a.engine,
+                }
                 for a in self.agents.values()
             ],
             "observers": len(self.observers),
@@ -186,14 +204,20 @@ class RoomServer:
                 log_path = os.path.join(_SERVER_DIR, "opencode_serve.log")
                 lf = open(log_path, "w")
                 self.opencode_proc = await asyncio.create_subprocess_exec(
-                    "opencode", "serve", "--port", str(OPENCODE_PORT),
-                    stdout=lf, stderr=lf,
+                    "opencode",
+                    "serve",
+                    "--port",
+                    str(OPENCODE_PORT),
+                    stdout=lf,
+                    stderr=lf,
                 )
                 # Wait up to 5 s for it to become healthy
                 for _ in range(10):
                     await asyncio.sleep(0.5)
                     if await _opencode_healthy():
-                        log.info(f"opencode serve started (pid={self.opencode_proc.pid})")
+                        log.info(
+                            f"opencode serve started (pid={self.opencode_proc.pid})"
+                        )
                         self.available_engines.append("opencode")
                         break
                 else:
@@ -209,12 +233,28 @@ class RoomServer:
 
         log.info(f"Available engines: {self.available_engines}")
 
-    async def _spawn_agent_process(self, room: Room, name: str, model_id: str, engine: str = "opencode", owner_name: str = "") -> bool:
+    async def _spawn_agent_process(
+        self,
+        room: Room,
+        name: str,
+        model_id: str,
+        engine: str = "opencode",
+        owner_name: str = "",
+    ) -> bool:
         """Spawn a bridge.py subprocess and track it. Returns True on success."""
         bridge_path = os.path.join(_SERVER_DIR, "bridge.py")
         log_path = os.path.join(_SERVER_DIR, f"agent_{name}.log")
 
-        cmd = [sys.executable, bridge_path, "--room", room.room_id, "--name", name, "--engine", engine]
+        cmd = [
+            sys.executable,
+            bridge_path,
+            "--room",
+            room.room_id,
+            "--name",
+            name,
+            "--engine",
+            engine,
+        ]
         if engine == "opencode":
             cmd += ["--opencode-model", model_id, "--model", model_id]
         else:
@@ -233,7 +273,9 @@ class RoomServer:
                 cwd=_SERVER_DIR,
             )
             self.spawned_procs.append(proc)
-            log.info(f"Spawned agent '{name}' ({engine}/{model_id}) | pid={proc.pid} | room={room.room_id}")
+            log.info(
+                f"Spawned agent '{name}' ({engine}/{model_id}) | pid={proc.pid} | room={room.room_id}"
+            )
             return True
         except Exception as e:
             log.error(f"Failed to spawn agent '{name}': {e}")
@@ -300,13 +342,17 @@ class RoomServer:
         # Build per-agent payloads so private history entries are properly filtered
         await asyncio.gather(
             *[
-                a.ws.send(json.dumps({
-                    "type": "your_turn",
-                    "broadcast": True,
-                    "history": room.context_window(a.agent_id),
-                    "summary": room.rolling_summary,
-                    "context": context_base,
-                }))
+                a.ws.send(
+                    json.dumps(
+                        {
+                            "type": "your_turn",
+                            "broadcast": True,
+                            "history": room.context_window(a.agent_id),
+                            "summary": room.rolling_summary,
+                            "context": context_base,
+                        }
+                    )
+                )
                 for a in agents
             ],
             return_exceptions=True,
@@ -314,14 +360,18 @@ class RoomServer:
 
         # Notify observers: one turn_start per agent
         for agent in agents:
-            await self._broadcast(room, {
-                "type": "turn_start",
-                "agent_id": agent.agent_id,
-                "name": agent.name,
-                "model": agent.model,
-                "broadcast": True,
-                "turn_number": len(room.history) + 1,
-            }, agents_only=False)
+            await self._broadcast(
+                room,
+                {
+                    "type": "turn_start",
+                    "agent_id": agent.agent_id,
+                    "name": agent.name,
+                    "model": agent.model,
+                    "broadcast": True,
+                    "turn_number": len(room.history) + 1,
+                },
+                agents_only=False,
+            )
 
         log.info(f"[{room.room_id}] broadcast → {[a.name for a in agents]}")
 
@@ -390,18 +440,26 @@ class RoomServer:
 
                 observer_id = msg.get("observer_id", str(uuid.uuid4())[:8])
                 is_owner = msg.get("owner", False)
-                obs = Observer(ws=ws, observer_id=observer_id, name=name, is_owner=is_owner)
+                obs = Observer(
+                    ws=ws, observer_id=observer_id, name=name, is_owner=is_owner
+                )
 
                 # Kick out any existing owner if a new owner joins
                 if is_owner:
                     for old_id, old_obs in list(room.observers.items()):
                         if old_obs.is_owner and old_id != observer_id:
-                            log.info(f"Replacing old owner '{old_obs.name}' with '{name}'")
+                            log.info(
+                                f"Replacing old owner '{old_obs.name}' with '{name}'"
+                            )
                             try:
-                                await old_obs.ws.send(json.dumps({
-                                    "type": "error",
-                                    "message": f"你已被新的 owner '{name}' 取代，連線關閉。",
-                                }))
+                                await old_obs.ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "error",
+                                            "message": f"你已被新的 owner '{name}' 取代，連線關閉。",
+                                        }
+                                    )
+                                )
                                 await old_obs.ws.close()
                             except Exception:
                                 pass
@@ -410,7 +468,9 @@ class RoomServer:
                 room.observers[observer_id] = obs
                 identity = obs
 
-                log.info(f"Observer joined | room={room_id} | name={name} | owner={is_owner}")
+                log.info(
+                    f"Observer joined | room={room_id} | name={name} | owner={is_owner}"
+                )
 
                 await ws.send(
                     json.dumps(
@@ -438,26 +498,38 @@ class RoomServer:
 
                     # ── spawn_agent: server spawns a bridge subprocess ────────
                     if msg_type == "spawn_agent":
-                        agent_name = owner_msg.get("name", "agent")   # different var from observer name
+                        agent_name = owner_msg.get(
+                            "name", "agent"
+                        )  # different var from observer name
                         model_id = owner_msg.get("model", "")
                         engine = owner_msg.get("engine", "opencode")
                         if engine not in self.available_engines:
-                            await ws.send(json.dumps({
-                                "type": "spawn_result",
-                                "name": agent_name,
-                                "model": model_id,
-                                "success": False,
-                                "reason": f"engine '{engine}' not available on this server",
-                            }))
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "spawn_result",
+                                        "name": agent_name,
+                                        "model": model_id,
+                                        "success": False,
+                                        "reason": f"engine '{engine}' not available on this server",
+                                    }
+                                )
+                            )
                             continue
-                        ok = await self._spawn_agent_process(room, agent_name, model_id, engine, owner_name=name)
-                        await ws.send(json.dumps({
-                            "type": "spawn_result",
-                            "name": agent_name,
-                            "model": model_id,
-                            "engine": engine,
-                            "success": ok,
-                        }))
+                        ok = await self._spawn_agent_process(
+                            room, agent_name, model_id, engine, owner_name=name
+                        )
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "spawn_result",
+                                    "name": agent_name,
+                                    "model": model_id,
+                                    "engine": engine,
+                                    "success": ok,
+                                }
+                            )
+                        )
                         continue
 
                     # ── kick_all: owner removes every agent from the room ─────
@@ -472,10 +544,13 @@ class RoomServer:
                             room.turn_pending = False
                             room.round_speakers = set()
 
-                            await self._broadcast(room, {
-                                "type": "system_message",
-                                "text": "All agents were kicked from the room",
-                            })
+                            await self._broadcast(
+                                room,
+                                {
+                                    "type": "system_message",
+                                    "text": "All agents were kicked from the room",
+                                },
+                            )
 
                             # Close WebSockets fire-and-forget (they're already removed)
                             async def _close(ws):
@@ -483,6 +558,7 @@ class RoomServer:
                                     await asyncio.wait_for(ws.close(), timeout=2.0)
                                 except Exception:
                                     pass
+
                             asyncio.ensure_future(
                                 asyncio.gather(*[_close(t.ws) for t in targets])
                             )
@@ -503,19 +579,26 @@ class RoomServer:
                                 room.current_speaker = None
                                 room.turn_pending = False
                             room.round_speakers.discard(target.agent_id)
-                            await self._broadcast(room, {
-                                "type": "system_message",
-                                "text": f"{kick_name} was kicked from the room",
-                            })
+                            await self._broadcast(
+                                room,
+                                {
+                                    "type": "system_message",
+                                    "text": f"{kick_name} was kicked from the room",
+                                },
+                            )
                             try:
                                 await target.ws.close()
                             except Exception:
                                 pass
                         else:
-                            await ws.send(json.dumps({
-                                "type": "system_message",
-                                "text": f"找不到成員 '{kick_name}'",
-                            }))
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "system_message",
+                                        "text": f"找不到成員 '{kick_name}'",
+                                    }
+                                )
+                            )
                         continue
 
                     # ── broadcast: owner fires message to all agents at once ───
@@ -524,10 +607,14 @@ class RoomServer:
                         if not content:
                             continue
                         if not room.agents:
-                            await ws.send(json.dumps({
-                                "type": "system_message",
-                                "text": "目前沒有 agent 可以廣播，請先用 /add-agent 加入。",
-                            }))
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "system_message",
+                                        "text": "目前沒有 agent 可以廣播，請先用 /add-agent 加入。",
+                                    }
+                                )
+                            )
                             continue
                         timestamp = datetime.now(timezone.utc).isoformat()
                         room.current_round += 1
@@ -587,12 +674,16 @@ class RoomServer:
                                 f"[{room_id}] [whisper→{target.name}] {name}: {content[:80]}"
                             )
                             # Broadcast to observers only (other agents must not see this)
-                            await self._broadcast(room, {
-                                "type": "message",
-                                "is_private": True,
-                                "private_to": [target.name],
-                                **entry,
-                            }, observers_only=True)
+                            await self._broadcast(
+                                room,
+                                {
+                                    "type": "message",
+                                    "is_private": True,
+                                    "private_to": [target.name],
+                                    **entry,
+                                },
+                                observers_only=True,
+                            )
                             if not room.turn_pending:
                                 await self._send_your_turn(room, target)
                             continue
@@ -611,32 +702,53 @@ class RoomServer:
                     if not room.owner_kicked_off and len(room.agents) >= 1:
                         room.owner_kicked_off = True
                         room.topic = content
-                        log.info(f"[{room_id}] Owner kickoff! Topic set: {content[:60]}")
+                        log.info(
+                            f"[{room_id}] Owner kickoff! Topic set: {content[:60]}"
+                        )
 
                     # Give first unspoken agent a turn (kickoff or new round)
-                    if room.owner_kicked_off and len(room.agents) >= 1 and not room.turn_pending:
+                    if (
+                        room.owner_kicked_off
+                        and len(room.agents) >= 1
+                        and not room.turn_pending
+                    ):
                         first_agent = next(iter(room.agents.values()))
-                        await self._send_your_turn(room, first_agent, kickoff=not room.owner_kicked_off)
+                        await self._send_your_turn(
+                            room, first_agent, kickoff=not room.owner_kicked_off
+                        )
                     elif room.owner_kicked_off and len(room.agents) == 0:
-                        await ws.send(json.dumps({
-                            "type": "waiting_for_owner",
-                            "message": "目前房間沒有 agent，請用 /add-agent 加入。",
-                        }))
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "waiting_for_owner",
+                                    "message": "目前房間沒有 agent，請用 /add-agent 加入。",
+                                }
+                            )
+                        )
 
                 return
 
             # ── Agent path ────────────────────────────────────────────────────
             agent_id = msg.get("agent_id", name)
             model = msg.get("model", "unknown")
+            engine = msg.get("engine", "")
 
             agent = Agent(
-                ws=ws, agent_id=agent_id, name=name, model=model, room_id=room_id
+                ws=ws,
+                agent_id=agent_id,
+                name=name,
+                model=model,
+                room_id=room_id,
+                engine=engine,
             )
             room.agents[agent_id] = agent
             identity = agent
 
             log.info(f"Agent joined | room={room_id} | agent={name} ({model})")
 
+            log.info(
+                f"DEBUG: agents_in_room = {[(a.name, a.engine) for a in room.agents.values()]}"
+            )
             await ws.send(
                 json.dumps(
                     {
@@ -645,7 +757,12 @@ class RoomServer:
                         "room_id": room_id,
                         "agent_id": agent_id,
                         "agents_in_room": [
-                            {"agent_id": a.agent_id, "name": a.name, "model": a.model}
+                            {
+                                "agent_id": a.agent_id,
+                                "name": a.name,
+                                "model": a.model,
+                                "engine": a.engine,
+                            }
                             for a in room.agents.values()
                         ],
                     }
@@ -659,6 +776,7 @@ class RoomServer:
                     "agent_id": agent_id,
                     "name": name,
                     "model": model,
+                    "engine": engine,
                     "agents_in_room": len(room.agents),
                 },
                 exclude_id=agent_id,
@@ -689,11 +807,13 @@ class RoomServer:
                     msg["turn"] = room.current_round
                     # Store in thinking_log with FIFO (max 20 entries per agent)
                     agent_log = room.thinking_log.setdefault(agent_id, [])
-                    agent_log.append({
-                        "turn": room.current_round,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "blocks": msg.get("blocks", []),
-                    })
+                    agent_log.append(
+                        {
+                            "turn": room.current_round,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "blocks": msg.get("blocks", []),
+                        }
+                    )
                     if len(agent_log) > 20:
                         agent_log.pop(0)
                     # Broadcast to observers only (agents must NOT see each other's thinking)
@@ -703,15 +823,21 @@ class RoomServer:
                 if msg["type"] == "update_model":
                     new_model = msg.get("model", "").strip()
                     if new_model and new_model != agent.model:
-                        log.info(f"[{room_id}] {name} model updated: {agent.model} → {new_model}")
+                        log.info(
+                            f"[{room_id}] {name} model updated: {agent.model} → {new_model}"
+                        )
                         agent.model = new_model
                         model = new_model  # keep local var in sync for entry dicts
-                        await self._broadcast(room, {
-                            "type": "model_updated",
-                            "agent_id": agent_id,
-                            "name": name,
-                            "model": new_model,
-                        }, exclude_id=agent_id)
+                        await self._broadcast(
+                            room,
+                            {
+                                "type": "model_updated",
+                                "agent_id": agent_id,
+                                "name": name,
+                                "model": new_model,
+                            },
+                            exclude_id=agent_id,
+                        )
                     continue
 
                 if msg["type"] == "message":
@@ -737,18 +863,24 @@ class RoomServer:
                     hist_idx = len(room.history)
                     room.history.append(entry)
                     if is_private_reply and room.current_private_for is not None:
-                        room.private_visibility[hist_idx] = room.current_private_for.copy()
+                        room.private_visibility[hist_idx] = (
+                            room.current_private_for.copy()
+                        )
                         room.current_private_for = None
 
                     log.info(f"[{room_id}] {name} ({latency_ms}ms): {content[:80]}...")
 
                     # Private replies go only to observers; public replies go to everyone
                     if is_private_reply:
-                        await self._broadcast(room, {
-                            "type": "message",
-                            "is_private": True,
-                            **entry,
-                        }, observers_only=True)
+                        await self._broadcast(
+                            room,
+                            {
+                                "type": "message",
+                                "is_private": True,
+                                **entry,
+                            },
+                            observers_only=True,
+                        )
                     else:
                         await self._broadcast(room, {"type": "message", **entry})
 
@@ -771,22 +903,32 @@ class RoomServer:
                         # ── Private round complete: return control to owner ───
                         room.turn_pending = False
                         room.current_speaker = None
-                        log.info(f"[{room_id}] Private round complete. Waiting for owner.")
-                        await self._broadcast(room, {
-                            "type": "waiting_for_owner",
-                            "message": "私訊回覆完成，等待下一則訊息。",
-                        })
+                        log.info(
+                            f"[{room_id}] Private round complete. Waiting for owner."
+                        )
+                        await self._broadcast(
+                            room,
+                            {
+                                "type": "waiting_for_owner",
+                                "message": "私訊回覆完成，等待下一則訊息。",
+                            },
+                        )
                     elif room.broadcast_pending is not None:
                         # ── Broadcast mode: track who's still pending ────────
                         room.broadcast_pending.discard(agent_id)
                         if not room.broadcast_pending:
                             room.broadcast_pending = None
                             room.current_speaker = None
-                            log.info(f"[{room_id}] Broadcast round complete. Waiting for owner.")
-                            await self._broadcast(room, {
-                                "type": "waiting_for_owner",
-                                "message": "All agents have responded. Waiting for your next message.",
-                            })
+                            log.info(
+                                f"[{room_id}] Broadcast round complete. Waiting for owner."
+                            )
+                            await self._broadcast(
+                                room,
+                                {
+                                    "type": "waiting_for_owner",
+                                    "message": "All agents have responded. Waiting for your next message.",
+                                },
+                            )
                     else:
                         # ── Sequential mode: pass turn to next agent ─────────
                         room.turn_pending = False
@@ -796,10 +938,13 @@ class RoomServer:
                         else:
                             room.current_speaker = None
                             log.info(f"[{room_id}] Round complete. Waiting for owner.")
-                            await self._broadcast(room, {
-                                "type": "waiting_for_owner",
-                                "message": "All agents have responded. Waiting for your next message.",
-                            })
+                            await self._broadcast(
+                                room,
+                                {
+                                    "type": "waiting_for_owner",
+                                    "message": "All agents have responded. Waiting for your next message.",
+                                },
+                            )
 
                 elif msg["type"] == "leave":
                     break
@@ -843,14 +988,22 @@ class RoomServer:
                     if not room.broadcast_pending:
                         room.broadcast_pending = None
                         room.current_speaker = None
-                        log.info(f"[{room.room_id}] Broadcast round complete (agent left).")
-                        await self._broadcast(room, {
-                            "type": "waiting_for_owner",
-                            "message": "All agents have responded. Waiting for your next message.",
-                        })
+                        log.info(
+                            f"[{room.room_id}] Broadcast round complete (agent left)."
+                        )
+                        await self._broadcast(
+                            room,
+                            {
+                                "type": "waiting_for_owner",
+                                "message": "All agents have responded. Waiting for your next message.",
+                            },
+                        )
 
                 # If this agent was the target of a private turn, clear the private state
-                if room.current_private_for and agent.agent_id in room.current_private_for:
+                if (
+                    room.current_private_for
+                    and agent.agent_id in room.current_private_for
+                ):
                     room.current_private_for = None
 
                 # Reassign turn if the speaker just left (sequential mode only)
@@ -880,7 +1033,9 @@ async def main():
     await server.startup()
 
     try:
-        async with websockets.serve(server.handle_connection, host, port, ping_interval=60, ping_timeout=300):
+        async with websockets.serve(
+            server.handle_connection, host, port, ping_interval=60, ping_timeout=300
+        ):
             log.info(f"Server ready. Engines: {server.available_engines}")
             await asyncio.Future()
     finally:

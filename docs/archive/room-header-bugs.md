@@ -50,23 +50,45 @@ The listener handles `tool-call` but not `tool-input-start`, `tool-result`, or `
 
 ## Todo List
 
-- [ ] **[bridge.py] Add `finally` flush for `reasoning_buf`**
+- [x] **[bridge.py] Add `finally` flush for `reasoning_buf`**
   In `_opencode_sse_listener()`, add a `finally` block that flushes any remaining `reasoning_buf` content as a `{"type": "thinking"}` block before the coroutine exits.
 
-- [ ] **[bridge.py] Fix SSE listener early-exit race condition**
+- [x] **[bridge.py] Fix SSE listener early-exit race condition**
   Do not `break` immediately when `done_task.done()` is true. Instead, continue draining the SSE stream until it naturally ends or the buffer is empty before exiting the loop.
 
-- [ ] **[bridge.py] Add handlers for `tool-input-start`, `tool-result`, `tool-error` SSE events**
+- [x] **[bridge.py] Add handlers for `tool-input-start`, `tool-result`, `tool-error` SSE events**
   Map these to appropriate `{"type": "tool_use"}` blocks so the header can show richer intermediate states (e.g. `Bash(ls)` completing, tool errors).
 
-- [ ] **[bridge.py] Consider real-time delta streaming for reasoning**
-  Instead of accumulating the full `reasoning_buf` before flushing, send incremental `agent_thinking` events on each `reasoning-delta` so the header updates continuously during thinking.
+- [x] **[bridge.py] Real-time delta streaming for reasoning**
+  Each `reasoning-delta` / `message.part.delta[field=reasoning]` now immediately sends an `agent_thinking` event with the accumulated text so far, instead of batching until `reasoning-end`. This was confirmed by Andy as the core user-visible symptom (header stuck on `thinking...` throughout).
 
-- [ ] **[openparty_tui.py] Fix `update_block()` to handle `"text"` block type**
-  Add an `elif btype == "text":` branch (e.g. set status to `"responding..."`) or add a final `else` fallback so the method always produces a meaningful status update regardless of block type.
+- [x] **[openparty_tui.py] Fix `update_block()` to handle `"text"` block type**
+  Added `elif btype == "text":` branch (sets status to `"responding..."`) and a final `else` fallback so the method always produces a meaningful status update regardless of block type.
 
-- [ ] **[bridge.py] Increase or make configurable the SSE grace period**
-  The current 5-second `SSE_TIMEOUT` in `_call_opencode_with_thinking()` may be insufficient for slow tool calls. Consider increasing or tying it to observed SSE activity.
+- [x] **[bridge.py] Increase or make configurable the SSE grace period**
+  Increased `SSE_TIMEOUT` from 5s to 15s. Additionally, an activity-based early exit is now in place (see Review Finding B below) so worst-case stall is bounded to 3s of idle time after `done_task` completes, not the full 15s.
 
-- [ ] **[openparty_tui.py] (Minor) Eliminate double render in `turn_start` handler**
-  Remove the redundant `header.update_info()` call before `header.start_thinking()`, or merge them into a single method that performs one render.
+- [x] **[openparty_tui.py] (Minor) Eliminate double render in `turn_start` handler**
+  Removed the redundant `header.update_info()` call before `header.start_thinking()`. Only one `_refresh_display()` is triggered per `turn_start` event.
+
+---
+
+## Post-Implementation Review Notes (from code review)
+
+### Review Finding A: `tool-result` / `tool-error` suffix is a display hack
+
+**Raised by:** claude-sonne-2  
+**File:** `bridge.py` + `openparty_tui.py`
+
+The original implementation appended `:done` / `:error` to the tool name (e.g. `tool:done(result_preview)`) to distinguish result/error states. This is a hack — the display format leaks into the data layer.
+
+**Fix applied (turn #11):** Introduced dedicated block types `"tool_result"` and `"tool_error"` in `bridge.py`. Updated `update_block()` in `openparty_tui.py` with `elif btype == "tool_result":` and `elif btype == "tool_error":` branches that format the display string independently of the data layer. ✅ **Fixed**
+
+### Review Finding B: SSE listener may stall up to 15s if terminal event never arrives
+
+**Raised by:** claude-opus-  
+**File:** `bridge.py` — `_opencode_sse_listener()`
+
+After removing the `done_task.done()` early break, the listener previously exited only on terminal SSE events (`finish-step` / `message.stop` / `text-end`) or stream EOF. If OpenCode never sends these events (edge case: abnormal termination, older versions), the listener would hang until the 15-second `SSE_TIMEOUT` fires.
+
+**Fix applied (turn #11):** After `done_task.done()` is true, `_last_event_ts` tracks the last received SSE event timestamp. If no new SSE events arrive within 3 seconds (`_SSE_IDLE_AFTER_DONE = 3.0`), the listener breaks early rather than waiting the full 15s timeout. ✅ **Fixed**
