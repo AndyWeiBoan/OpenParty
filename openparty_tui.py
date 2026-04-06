@@ -217,6 +217,14 @@ class RoomHeader(Static):
                 first_val = str(next(iter(inp.values()), "")) if inp else ""
                 self._agent_status[agent_name] = f"{tool}({first_val[:18]})"
                 break
+            elif btype == "text":
+                # Text block means the agent is producing its final response
+                self._agent_status[agent_name] = "responding..."
+                break
+            else:
+                # Unknown block type — use generic label rather than leaving stale status
+                self._agent_status[agent_name] = "thinking..."
+                break
         self._refresh_display()
 
     def _tick(self) -> None:
@@ -888,7 +896,8 @@ class OpenPartyApp(App):
             self._thinking.add(agent_name)
             self._turn_complete.discard(agent_name)  # reset guard for this agent
             header = self.query_one("#room-header", RoomHeader)
-            header.update_info(self.room_id, self._topic, self.agents)
+            # start_thinking() calls _refresh_display() internally; no need for
+            # a separate update_info() call here (which would double-render).
             header.start_thinking(agent_name)
             self.query_one("#round-status-bar", StatusBar).set_thinking(True)
 
