@@ -11,7 +11,11 @@ import json
 import argparse
 import fnmatch
 import os
+import platform
 import re
+import shutil
+import subprocess
+import uuid as uuid_mod
 from datetime import datetime
 from pathlib import Path
 
@@ -110,6 +114,112 @@ def _parse_to_rich(text: str, base_style: Style) -> Text:
     if last < len(text):
         result.append(text[last:], style=base_style)
     return result
+
+
+# ── Image clipboard helpers ────────────────────────────────────────────────────
+
+IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 5 MB Anthropic API limit
+
+# Magic bytes for supported image formats
+_IMAGE_MAGIC: list[tuple[bytes, str]] = [
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"RIFF", "image/webp"),  # RIFF....WEBP — verified further below
+]
+
+
+def _verify_mime_from_bytes(data: bytes) -> str | None:
+    """Return MIME type from magic bytes, or None if unrecognised."""
+    for magic, mime in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            if mime == "image/webp" and data[8:12] != b"WEBP":
+                continue
+            return mime
+    return None
+
+
+def _grab_clipboard_image():
+    """
+    Try to grab an image from the OS clipboard.
+    Returns a PIL.Image.Image on success, None otherwise.
+    Does NOT import PIL at module level — only when needed.
+    """
+    try:
+        from PIL import Image, ImageGrab  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+
+    system = platform.system()
+
+    if system == "Darwin":
+        # macOS: PIL.ImageGrab.grabclipboard() works well
+        try:
+            img = ImageGrab.grabclipboard()
+            if isinstance(img, Image.Image):
+                return img
+        except Exception:
+            pass
+        return None
+
+    if system == "Linux":
+        # Try xclip (X11) then wl-paste (Wayland)
+        for cmd in [
+            ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+            ["wl-paste", "--type", "image/png"],
+        ]:
+            if not shutil.which(cmd[0]):
+                continue
+            try:
+                data = subprocess.check_output(cmd, timeout=2)
+                if data:
+                    from io import BytesIO
+
+                    return Image.open(BytesIO(data))
+            except Exception:
+                pass
+        return None
+
+    return None
+
+
+def _save_clipboard_image(img, save_dir: str, name: str) -> tuple[str, str]:
+    """
+    Resize + compress a PIL image and save to disk.
+
+    Args:
+        img:      PIL.Image.Image
+        save_dir: directory to save into (must already exist)
+        name:     base filename without extension (e.g. a UUID)
+
+    Returns:
+        (final_path, mime_type)
+
+    The function decides the file extension based on alpha-channel presence:
+    - alpha → WebP (lossless-ish, small)
+    - no alpha → JPEG (smallest for screenshots)
+    """
+    from PIL import Image  # type: ignore[import-untyped]
+
+    # 1. Resize: constrain longest edge to 1568px (Anthropic vision sweet spot)
+    img.thumbnail((1568, 1568), Image.Resampling.LANCZOS)
+
+    # 2. Choose format based on transparency
+    has_alpha = img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    )
+
+    if has_alpha:
+        final_path = os.path.join(save_dir, f"{name}.webp")
+        img.save(final_path, "WEBP", quality=85)
+        return final_path, "image/webp"
+    else:
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        final_path = os.path.join(save_dir, f"{name}.jpg")
+        img.save(final_path, "JPEG", quality=85, optimize=True)
+        return final_path, "image/jpeg"
 
 
 # ── File search helper ─────────────────────────────────────────────────────────
@@ -509,6 +619,54 @@ class MessageInput(TextArea):
             count += 1
         self.move_cursor((row, col))
 
+    def on_paste(self, event: events.Paste) -> None:
+        """Intercept paste events to detect clipboard images."""
+        app: OpenPartyApp = self.app  # type: ignore[assignment]
+        # Only handle image paste for the owner input
+        if not getattr(app, "owner", False):
+            return
+        # Try to grab an image from the OS clipboard (independent of paste text)
+        img = _grab_clipboard_image()
+        if img is None:
+            # No image — let normal text paste proceed
+            return
+        # Got an image: prevent the default paste and handle as image attachment
+        event.prevent_default()
+        event.stop()
+        # Ensure save directory exists
+        os.makedirs(app._image_save_dir, exist_ok=True)
+        # Validate size before processing (rough check on raw bytes)
+        from io import BytesIO
+
+        buf = BytesIO()
+        img.save(buf, format=img.format or "PNG")
+        raw_size = buf.tell()
+        if raw_size > IMAGE_MAX_BYTES:
+            # Reject early if raw size already exceeds the 5 MB limit
+            app._chat(
+                f"[error] 圖片太大（{raw_size // 1024 // 1024} MB），超過 5 MB 上限，已略過。"
+            )
+            return
+        # Save with compression pipeline
+        name = str(uuid_mod.uuid4())
+        try:
+            final_path, mime = _save_clipboard_image(img, app._image_save_dir, name)
+        except Exception as exc:
+            app._chat(f"[error] 圖片儲存失敗：{exc}")
+            return
+        # Final size check after compression
+        final_size = os.path.getsize(final_path)
+        if final_size > IMAGE_MAX_BYTES:
+            os.unlink(final_path)
+            app._chat(
+                f"[error] 壓縮後圖片仍超過 5 MB（{final_size // 1024 // 1024} MB），已略過。"
+            )
+            return
+        app._pending_images.append({"path": final_path, "mime": mime})
+        fname = os.path.basename(final_path)
+        kb = final_size // 1024
+        app._chat(f"[🖼 {fname} ({kb} KB) 已附加，傳送訊息時一併送出]")
+
     def on_key(self, event: events.Key) -> None:
         app: OpenPartyApp = self.app  # type: ignore[assignment]
 
@@ -737,6 +895,13 @@ class OpenPartyApp(App):
         self._completing_type: str = "command"
         self._completion_items: list[tuple[str, str]] = []
 
+        # Image paste state
+        self._pending_images: list[dict] = []  # [{"path": ..., "mime": ...}]
+        self._session_id: str = str(uuid_mod.uuid4())[:8]
+        self._image_save_dir: str = os.path.join(
+            "/tmp", "openparty", "images", self._session_id
+        )
+
     @property
     def display_name(self) -> str:
         return f"[owner] {self.owner_name}" if self.owner else self.owner_name
@@ -753,6 +918,14 @@ class OpenPartyApp(App):
         if self.owner:
             self.query_one("#input", MessageInput).focus()
         asyncio.create_task(self._run_ws())
+
+    def on_unmount(self) -> None:
+        """Clean up image temp directory when app exits."""
+        if os.path.isdir(self._image_save_dir):
+            try:
+                shutil.rmtree(self._image_save_dir)
+            except Exception:
+                pass
 
     def _refresh_header(self) -> None:
         """Update the room header with current agent list and topic."""
@@ -1243,6 +1416,10 @@ class OpenPartyApp(App):
             files = await loop.run_in_executor(None, _extract_file_attachments, text)
             if files:
                 payload["files"] = files
+            # Attach pending images (from clipboard paste)
+            if self._pending_images:
+                payload["images"] = list(self._pending_images)
+                self._pending_images.clear()
             await self.ws.send(json.dumps(payload))
 
 

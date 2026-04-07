@@ -241,13 +241,16 @@ def build_prompt(
     agent_name: str,
     owner_name: str = "",
     session_id: str | None = None,
-) -> str:
+) -> "str | list[dict]":
     """Convert your_turn payload into a prompt for Claude Agent SDK.
 
     History strategy:
     - Server sends the correct round-aware window (previous round + current round so far).
       No truncation needed here — use the full window as-is so every agent sees all
       messages from the current discussion round regardless of speaking order.
+
+    If image_blocks are present, returns a list of content blocks (multipart prompt)
+    that the caller should pass to query() as a streaming user message.
     """
     history = your_turn_payload.get("history", [])
     context = your_turn_payload.get("context", {})
@@ -306,7 +309,16 @@ def build_prompt(
         "reply with a brief acknowledgment or observation. Never return an empty response."
     )
 
-    return "\n".join(lines)
+    text_prompt = "\n".join(lines)
+
+    # If the payload contains image_blocks, return a multipart content list
+    # so the caller can pass them as a user message to the Claude Agent SDK.
+    image_blocks = your_turn_payload.get("image_blocks", [])
+    if image_blocks:
+        # Build a content list: images first, then the text prompt
+        return image_blocks + [{"type": "text", "text": text_prompt}]
+
+    return text_prompt
 
 
 # ── Bridge ─────────────────────────────────────────────────────────────────────
@@ -458,10 +470,19 @@ class AgentBridge:
                 try:
                     if self.engine == "opencode":
                         assert self._opencode is not None
+                        # opencode does not support image content blocks — extract text only
+                        prompt_str = (
+                            next(
+                                (b["text"] for b in prompt if b.get("type") == "text"),
+                                "",
+                            )
+                            if isinstance(prompt, list)
+                            else prompt
+                        )
                         if self.ws is not None:
-                            reply = await self._call_opencode_with_thinking(prompt)
+                            reply = await self._call_opencode_with_thinking(prompt_str)
                         else:
-                            reply = await self._opencode.call(prompt)
+                            reply = await self._opencode.call(prompt_str)
                     else:
                         reply, actual_model = await self._call_claude(prompt)
                         # On first response, announce the real model version to the server
@@ -494,10 +515,24 @@ class AgentBridge:
                     try:
                         if self.engine == "opencode":
                             assert self._opencode is not None
+                            prompt_str = (
+                                next(
+                                    (
+                                        b["text"]
+                                        for b in prompt
+                                        if b.get("type") == "text"
+                                    ),
+                                    "",
+                                )
+                                if isinstance(prompt, list)
+                                else prompt
+                            )
                             if self.ws is not None:
-                                reply = await self._call_opencode_with_thinking(prompt)
+                                reply = await self._call_opencode_with_thinking(
+                                    prompt_str
+                                )
                             else:
-                                reply = await self._opencode.call(prompt)
+                                reply = await self._opencode.call(prompt_str)
                         else:
                             reply, _ = await self._call_claude(prompt)
                     except FatalAgentError:
@@ -746,7 +781,9 @@ class AgentBridge:
                                     )
                                 elif status == "error":
                                     error = state.get("error", "error")
-                                    error_preview = str(error)[:40] if error else "error"
+                                    error_preview = (
+                                        str(error)[:40] if error else "error"
+                                    )
                                     await self._send_agent_thinking(
                                         [
                                             {
@@ -806,17 +843,25 @@ class AgentBridge:
             except Exception:
                 pass
 
-    async def _call_claude(self, prompt: str) -> tuple[str, Optional[str]]:
+    async def _call_claude(
+        self, prompt: "str | list[dict]"
+    ) -> tuple[str, Optional[str]]:
         """Call Claude Agent SDK and return (result_text, actual_model).
 
         actual_model is the real model string from the first AssistantMessage
         (e.g. "claude-sonnet-4-5"), or None if not detected.
 
+        prompt can be a plain str or a list of content blocks (for image support).
+        When a list is provided, it is passed as a multipart user message.
+
         Raises FatalAgentError for non-recoverable provider errors
         (rate limit, auth failure) so the caller can leave gracefully.
         """
 
+        stderr_buffer: list[str] = []
+
         def _stderr_callback(line: str) -> None:
+            stderr_buffer.append(line)
             self.log.warning(f"[CLI stderr] {line}")
 
         options = ClaudeAgentOptions(
@@ -833,8 +878,23 @@ class AgentBridge:
         result_is_error = False
         actual_model: Optional[str] = None
 
+        # If prompt is a content block list (includes images), wrap it as an
+        # AsyncIterable user message for the SDK streaming interface.
+        async def _content_blocks_iter(blocks: list[dict]):
+            yield {
+                "type": "user",
+                "message": {"role": "user", "content": blocks},
+                "parent_tool_use_id": None,
+                "session_id": self.session_id,
+            }
+
+        if isinstance(prompt, list):
+            prompt_arg = _content_blocks_iter(prompt)
+        else:
+            prompt_arg = prompt
+
         try:
-            async for message in query(prompt=prompt, options=options):
+            async for message in query(prompt=prompt_arg, options=options):  # type: ignore[arg-type]
                 if isinstance(message, SystemMessage):
                     sid = getattr(message, "session_id", None)
                     if sid and self.session_id is None:
@@ -870,10 +930,16 @@ class AgentBridge:
         except ProcessError as e:
             exit_code = getattr(e, "exit_code", None)
             stderr_text = getattr(e, "stderr", None)
+            collected_stderr = "\n".join(stderr_buffer) if stderr_buffer else "(no stderr lines collected)"
             self.log.error(
                 f"CLI ProcessError: exit_code={exit_code}, "
                 f"stderr={stderr_text!r}, msg={e}, "
                 f"repr={repr(e)}, attrs={e.__dict__}"
+            )
+            self.log.error(
+                f"=== COLLECTED STDERR ({len(stderr_buffer)} lines) ===\n"
+                f"{collected_stderr}\n"
+                f"=== END COLLECTED STDERR ==="
             )
             if result_text:
                 self.log.warning(
@@ -881,7 +947,7 @@ class AgentBridge:
                 )
             else:
                 return (
-                    f"(error: CLI exit {exit_code}: {stderr_text or 'no stderr captured'})",
+                    f"(error: CLI exit {exit_code}: {collected_stderr})",
                     actual_model,
                 )
         except Exception as e:

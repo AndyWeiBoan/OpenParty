@@ -16,6 +16,7 @@ M3 changes vs M2:
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 _MENTION_RE = re.compile(r"#([\w][\w\-]*)")
@@ -322,6 +324,44 @@ class RoomServer:
                 *[ws.send(payload) for ws in targets], return_exceptions=True
             )
 
+    def _build_image_blocks_from_history(self, history: list[dict]) -> list[dict]:
+        """Scan history for image attachments and return base64 image blocks.
+
+        Reads image files from disk, base64-encodes them, and returns Anthropic
+        image content blocks. Missing files are silently skipped (warn only).
+        """
+        image_blocks: list[dict] = []
+        for entry in history:
+            for img in entry.get("images", []):
+                img_path = img.get("path", "")
+                mime = img.get("mime", "image/jpeg")
+                if not img_path:
+                    continue
+                # Security: validate path is within the expected image sandbox
+                _IMAGE_SANDBOX = os.path.realpath("/tmp/openparty/images")
+                resolved = os.path.realpath(img_path)
+                if not resolved.startswith(_IMAGE_SANDBOX + os.sep) and resolved != _IMAGE_SANDBOX:
+                    log.warning(f"Rejected image path outside sandbox: {img_path} -> {resolved}")
+                    continue
+                try:
+                    data = Path(resolved).read_bytes()
+                    b64 = base64.b64encode(data).decode()
+                    image_blocks.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": b64,
+                            },
+                        }
+                    )
+                except FileNotFoundError:
+                    log.warning(f"Image file not found, skipping: {img_path}")
+                except Exception as e:
+                    log.warning(f"Failed to read image {img_path}: {e}")
+        return image_blocks
+
     async def _send_broadcast_turn(self, room: Room):
         """Send your_turn to ALL agents simultaneously (broadcast mode)."""
         agents = list(room.agents.values())
@@ -340,21 +380,22 @@ class RoomServer:
         }
 
         # Build per-agent payloads so private history entries are properly filtered
+        async def _send_one(a: Agent) -> None:
+            history_window = room.context_window(a.agent_id)
+            image_blocks = self._build_image_blocks_from_history(history_window)
+            payload: dict = {
+                "type": "your_turn",
+                "broadcast": True,
+                "history": history_window,
+                "summary": room.rolling_summary,
+                "context": context_base,
+            }
+            if image_blocks:
+                payload["image_blocks"] = image_blocks
+            await a.ws.send(json.dumps(payload))
+
         await asyncio.gather(
-            *[
-                a.ws.send(
-                    json.dumps(
-                        {
-                            "type": "your_turn",
-                            "broadcast": True,
-                            "history": room.context_window(a.agent_id),
-                            "summary": room.rolling_summary,
-                            "context": context_base,
-                        }
-                    )
-                )
-                for a in agents
-            ],
+            *[_send_one(a) for a in agents],
             return_exceptions=True,
         )
 
@@ -381,9 +422,12 @@ class RoomServer:
         room.turn_started_at = time.monotonic()
         room.turn_pending = True
 
+        history_window = room.context_window(agent.agent_id)
+        image_blocks = self._build_image_blocks_from_history(history_window)
+
         your_turn_payload = {
             "type": "your_turn",
-            "history": room.context_window(agent.agent_id),
+            "history": history_window,
             "summary": room.rolling_summary,
             "context": {
                 "topic": room.topic,
@@ -393,6 +437,8 @@ class RoomServer:
                 "total_turns": len(room.history),
             },
         }
+        if image_blocks:
+            your_turn_payload["image_blocks"] = image_blocks
         if kickoff:
             your_turn_payload["prompt"] = room.topic
 
@@ -629,6 +675,9 @@ class RoomServer:
                         files = owner_msg.get("files")
                         if files:
                             entry["files"] = files
+                        images = owner_msg.get("images")
+                        if images:
+                            entry["images"] = images
                         room.history.append(entry)
                         room.round_speakers = set()
                         if not room.owner_kicked_off:
@@ -655,6 +704,9 @@ class RoomServer:
                     files = owner_msg.get("files")
                     if files:
                         entry["files"] = files
+                    images = owner_msg.get("images")
+                    if images:
+                        entry["images"] = images
 
                     # ── Private message: #mention detected ───────────────────
                     mentions = _MENTION_RE.findall(content)
