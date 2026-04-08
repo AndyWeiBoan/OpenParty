@@ -82,3 +82,7 @@ KickPickerScreen {
     color: $background;
     text-style: bold;
 }
+
+ToastRack {
+    align: right top;
+}
