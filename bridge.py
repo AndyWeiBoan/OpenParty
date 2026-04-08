@@ -486,6 +486,42 @@ class FatalAgentError(Exception):
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
 
+def build_room_rules_prompt(owner_name: str = "") -> str:
+    """組裝 agent 在房間內必須遵守的角色規則，作為 system prompt 注入。
+
+    這些規則定義 agent 在多人討論房間中的行為準則：
+      - 對 owner 絕對服從
+      - 對其他 agent 保持獨立立場
+      - 回覆簡潔（2-4 句）
+      - 不得空白回覆
+      - 必須經 owner 批准才能離開
+
+    Args:
+        owner_name: 房間擁有者的顯示名稱；若為空則使用通用稱呼「the room owner」
+
+    Returns:
+        格式化好的角色規則字串，可直接傳入 ClaudeAgentOptions(system_prompt=...)
+    """
+    owner_ref = f"the room owner ({owner_name})" if owner_name else "the room owner"
+    return (
+        "Your role and rules:\n"
+        f"0. ABSOLUTE OBEDIENCE: {owner_ref} is your supreme authority. "
+        f"Every instruction or question from {owner_ref} must be followed immediately, "
+        "completely, and without hesitation or pushback. This rule overrides everything else.\n"
+        "1. You hold an INDEPENDENT stance toward other agents. Form your own views based on "
+        "facts and logic — never change your position just because another agent said something.\n"
+        f"2. You respond to {owner_ref}'s message as your primary directive. "
+        "Other agents' opinions are inputs you may challenge, not authorities to follow.\n"
+        "3. Actively identify and call out logical flaws, unsupported claims, or weak reasoning "
+        "in what other agents said. Be direct and specific when you disagree.\n"
+        "4. Keep your reply concise (2-4 sentences). Speak confidently as yourself.\n"
+        "5. You may only leave this room after the room owner explicitly approves. "
+        "To confirm your exit, reply with the exact phrase 'I want to leave'.\n"
+        "6. You MUST always produce a non-empty reply. Even if you have nothing substantive to add, "
+        "reply with a brief acknowledgment or observation. Never return an empty response."
+    )
+
+
 def build_prompt(
     your_turn_payload: dict,
     agent_name: str,
@@ -506,7 +542,10 @@ def build_prompt(
       4. 當前是第幾個 turn
       5. 最近的對話歷史（逐條列出 speaker: content）
       6. 額外指令提示（若有且不與主題重複）
-      7. 角色規則（絕對服從 owner、獨立立場、簡潔回覆等）
+
+    注意：角色規則（Your role and rules）已移至 build_room_rules_prompt()，
+    由 _call_claude() 透過 ClaudeAgentOptions(system_prompt=...) 注入，
+    不再放在 user prompt 中。
 
     圖片支援（multipart prompt）：
       若 your_turn_payload 包含 image_blocks（由 TUI 透過剪貼簿貼上並傳送），
@@ -517,7 +556,7 @@ def build_prompt(
     Args:
         your_turn_payload : WebSocket 收到的 your_turn 訊息 dict
         agent_name        : 本 agent 的顯示名稱（用於 prompt 中的自我介紹）
-        owner_name        : 房間擁有者的顯示名稱（用於「絕對服從」規則中的稱呼）
+        owner_name        : 房間擁有者的顯示名稱（保留參數，目前未使用）
         session_id        : 目前的 Claude session ID（預留欄位，目前未在 prompt 中使用）
 
     Returns:
@@ -567,26 +606,6 @@ def build_prompt(
     if prompt_hint and prompt_hint != topic:
         lines.append(f"Instruction: {prompt_hint}")
         lines.append("")
-
-    # 組裝角色規則區塊（固定格式，所有 agent 共用）
-    owner_ref = f"the room owner ({owner_name})" if owner_name else "the room owner"
-    lines.append(
-        "Your role and rules:\n"
-        f"0. ABSOLUTE OBEDIENCE: {owner_ref} is your supreme authority. "
-        f"Every instruction or question from {owner_ref} must be followed immediately, "
-        "completely, and without hesitation or pushback. This rule overrides everything else.\n"
-        "1. You hold an INDEPENDENT stance toward other agents. Form your own views based on "
-        "facts and logic — never change your position just because another agent said something.\n"
-        f"2. You respond to {owner_ref}'s message as your primary directive. "
-        "Other agents' opinions are inputs you may challenge, not authorities to follow.\n"
-        "3. Actively identify and call out logical flaws, unsupported claims, or weak reasoning "
-        "in what other agents said. Be direct and specific when you disagree.\n"
-        "4. Keep your reply concise (2-4 sentences). Speak confidently as yourself.\n"
-        "5. You may only leave this room after the room owner explicitly approves. "
-        "To confirm your exit, reply with the exact phrase 'I want to leave'.\n"
-        "6. You MUST always produce a non-empty reply. Even if you have nothing substantive to add, "
-        "reply with a brief acknowledgment or observation. Never return an empty response."
-    )
 
     text_prompt = "\n".join(lines)
 
@@ -1384,6 +1403,9 @@ class AgentBridge:
                 type="enabled", budget_tokens=8000
             ),  # 開啟 8K token 的 extended thinking
             stderr=_stderr_callback,  # 設定 stderr 回調以收集錯誤資訊
+            # 角色規則透過 system_prompt 注入，確保以最高權威層級生效，
+            # 不隨對話歷史增長而被稀釋
+            system_prompt=build_room_rules_prompt(self.owner_name),
         )
 
         result_text = ""  # 最終回覆文字（由 ResultMessage 填入）
