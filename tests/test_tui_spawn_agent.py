@@ -342,7 +342,7 @@ class TestProcessCleanup:
         proc2.returncode = None
         app.spawned_procs = [proc1, proc2]
 
-        await app._cleanup_spawned_procs()
+        app._cleanup_spawned_procs()
 
         proc1.terminate.assert_called_once()
         proc2.terminate.assert_called_once()
@@ -355,7 +355,7 @@ class TestProcessCleanup:
         proc.returncode = 0
         app.spawned_procs = [proc]
 
-        await app._cleanup_spawned_procs()
+        app._cleanup_spawned_procs()
 
         proc.terminate.assert_not_called()
 
@@ -367,7 +367,7 @@ class TestProcessCleanup:
         proc.returncode = None
         app.spawned_procs = [proc]
 
-        await app._cleanup_spawned_procs()
+        app._cleanup_spawned_procs()
 
         assert app.spawned_procs == []
 
@@ -381,7 +381,7 @@ class TestProcessCleanup:
         app.spawned_procs = [proc]
 
         # Should not raise
-        await app._cleanup_spawned_procs()
+        app._cleanup_spawned_procs()
 
     @pytest.mark.asyncio
     async def test_cleanup_empty_list_is_noop(self):
@@ -389,7 +389,7 @@ class TestProcessCleanup:
         app = make_test_app()
         app.spawned_procs = []
         # Should not raise
-        await app._cleanup_spawned_procs()
+        app._cleanup_spawned_procs()
 
 
 # ── 5. Server pure hub 靜態驗證 ─────────────────────────────────────────────────

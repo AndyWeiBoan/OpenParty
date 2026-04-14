@@ -2035,33 +2035,35 @@ class OpenPartyApp(App):
             server_url=self.server_url,
             room=self.room_id,
         )
+        log_file = open(log_path, "w")
         try:
-            log_file = open(log_path, "w")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=log_file,
-                stderr=log_file,
-                cwd=_TUI_DIR,
-            )
-            log_file.close()  # fd 交給子進程後立即關閉，避免 fd 洩漏
-            self.spawned_procs.append(proc)
-            return True
-        except FileNotFoundError as e:
-            self._chat(
-                Text(
-                    f"  [spawn] 找不到 bridge.py 或直譯器：{e}",
-                    style=RED_STYLE,
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=log_file,
+                    stderr=log_file,
+                    cwd=_TUI_DIR,
                 )
-            )
-            return False
-        except Exception as e:
-            self._chat(
-                Text(
-                    f"  [spawn] 啟動 {name} 失敗：{e}",
-                    style=RED_STYLE,
+                self.spawned_procs.append(proc)
+                return True
+            except FileNotFoundError as e:
+                self._chat(
+                    Text(
+                        f"  [spawn] 找不到 bridge.py 或直譯器：{e}",
+                        style=RED_STYLE,
+                    )
                 )
-            )
-            return False
+                return False
+            except Exception as e:
+                self._chat(
+                    Text(
+                        f"  [spawn] 啟動 {name} 失敗：{e}",
+                        style=RED_STYLE,
+                    )
+                )
+                return False
+        finally:
+            log_file.close()  # 成功或失敗都關閉，避免 fd 洩漏
 
     def _cleanup_spawned_procs(self) -> None:
         """終止所有由本 TUI spawn 的 bridge 子進程（已結束的跳過）。
