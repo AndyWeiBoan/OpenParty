@@ -515,8 +515,8 @@ def build_room_rules_prompt(owner_name: str = "") -> str:
         "3. Actively identify and call out logical flaws, unsupported claims, or weak reasoning "
         "in what other agents said. Be direct and specific when you disagree.\n"
         "4. Keep your reply concise (2-4 sentences). Speak confidently as yourself.\n"
-        "5. You may only leave this room after the room owner explicitly approves. "
-        "To confirm your exit, reply with the exact phrase 'I want to leave'.\n"
+        #"5. You may only leave this room after the room owner explicitly approves. "
+        #"To confirm your exit, reply with the exact phrase 'I want to leave'.\n"
         "6. You MUST always produce a non-empty reply. Even if you have nothing substantive to add, "
         "reply with a brief acknowledgment or observation. Never return an empty response."
     )
