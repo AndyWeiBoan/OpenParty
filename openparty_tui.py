@@ -1966,20 +1966,14 @@ class OpenPartyApp(App):
 
         # ── Fallback 清理：確保 bridge 子進程在異常退出時也能被終止 ──
         # Textual 的 Ctrl-C 預設行為不一定走 on_unmount，故同時用 atexit + SIGINT
-        def _sync_cleanup():
-            for proc in self.spawned_procs:
-                if proc.returncode is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
-
-        atexit.register(_sync_cleanup)
+        # 三條路徑（on_unmount / atexit / SIGINT）都透過 _cleanup_spawned_procs()，
+        # returncode is None guard 確保重複呼叫時不會 double-terminate。
+        atexit.register(self._cleanup_spawned_procs)
 
         _orig_sigint = signal.getsignal(signal.SIGINT)
 
         def _sigint_handler(signum, frame):
-            _sync_cleanup()
+            self._cleanup_spawned_procs()
             if callable(_orig_sigint):
                 _orig_sigint(signum, frame)
 
@@ -1997,13 +1991,7 @@ class OpenPartyApp(App):
             except Exception:
                 pass
         # 在 on_unmount 中同步清理子進程（asyncio loop 可能已停止，故用同步方式）
-        for proc in self.spawned_procs:
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-        self.spawned_procs.clear()
+        self._cleanup_spawned_procs()
 
     def _refresh_header(self) -> None:
         """更新 RoomHeader 顯示當前的 Agent 列表和討論主題。
@@ -2055,6 +2043,7 @@ class OpenPartyApp(App):
                 stderr=log_file,
                 cwd=_TUI_DIR,
             )
+            log_file.close()  # fd 交給子進程後立即關閉，避免 fd 洩漏
             self.spawned_procs.append(proc)
             return True
         except FileNotFoundError as e:
@@ -2074,8 +2063,11 @@ class OpenPartyApp(App):
             )
             return False
 
-    async def _cleanup_spawned_procs(self) -> None:
-        """終止所有由本 TUI spawn 的 bridge 子進程（已結束的跳過）。"""
+    def _cleanup_spawned_procs(self) -> None:
+        """終止所有由本 TUI spawn 的 bridge 子進程（已結束的跳過）。
+
+        同步方法，可在 on_unmount / atexit / SIGINT handler 任意呼叫。
+        """
         for proc in list(self.spawned_procs):
             if proc.returncode is None:
                 try:
