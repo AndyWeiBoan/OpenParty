@@ -28,8 +28,6 @@ import json
 import logging
 import os
 import re
-import shutil
-import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -40,49 +38,11 @@ from typing import Optional
 # 規則：名稱以字母或底線開頭，後續可接字母、數字、底線或連字號
 _MENTION_RE = re.compile(r"#([\w][\w\-]*)")
 
-import aiohttp
 import websockets
 from websockets.asyncio.server import ServerConnection as WebSocketServerProtocol
 
-# 伺服器腳本所在目錄，用於定位 bridge.py 及各種 log 檔路徑
+# 伺服器腳本所在目錄（用於各種 log 檔路徑）
 _SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
-OPENCODE_PORT = 4096
-OPENCODE_URL = f"http://127.0.0.1:{OPENCODE_PORT}"
-
-
-def _check_opencode_installed() -> bool:
-    """檢查 opencode CLI 是否已安裝並存在於 PATH 中。"""
-    return shutil.which("opencode") is not None
-
-
-def _check_claude_installed() -> bool:
-    """True if claude_agent_sdk with bundled binary is available."""
-    try:
-        import claude_agent_sdk
-
-        bundled = os.path.join(
-            os.path.dirname(claude_agent_sdk.__file__), "_bundled", "claude"
-        )
-        return os.path.isfile(bundled)
-    except ImportError:
-        pass
-    return shutil.which("claude") is not None
-
-
-async def _opencode_healthy() -> bool:
-    """向 opencode serve 的健康檢查端點發送請求，確認服務是否已就緒。
-
-    回傳 True 代表服務正常運行，回傳 False 代表尚未啟動或發生錯誤。
-    """
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                f"{OPENCODE_URL}/global/health",
-                timeout=aiohttp.ClientTimeout(total=2),
-            ) as r:
-                return r.status == 200
-    except Exception:
-        return False
 
 
 logging.basicConfig(
@@ -265,130 +225,24 @@ class Room:
 class RoomServer:
     def __init__(self):
         self.rooms: dict[str, Room] = {}
-        self.spawned_procs: list[asyncio.subprocess.Process] = []
-        self.opencode_proc: Optional[asyncio.subprocess.Process] = None
-        self.available_engines: list[str] = []  # ["opencode", "claude"]
+        # NOTE: spawned_procs、available_engines 已移至 TUI 端（openparty_tui.py）
+        # Server 現在是純 WebSocket hub，不負責 agent process 生命週期管理
 
     async def startup(self):
-        """Check installed tools and start opencode serve if available.
+        """Server startup — pure WebSocket hub, no engine detection needed.
 
-        【中文說明】兩階段引擎偵測：
-        1. 先嘗試 opencode：若已安裝則檢查是否已在執行（健康檢查），
-           尚未執行則自動啟動 `opencode serve` 子程序，等待最多 5 秒確認就緒後
-           將 "opencode" 加入 available_engines。
-        2. 再嘗試 claude：檢查 claude_agent_sdk 的捆綁二進位或系統 PATH 中的 claude，
-           若可用則將 "claude" 加入 available_engines。
+        【中文說明】Server 現為純 WebSocket hub，啟動時不再偵測或啟動 engine。
+        Engine 偵測與 bridge process spawn 的責任已移至 TUI 端（openparty_tui.py）。
         """
-        if _check_opencode_installed():
-            if await _opencode_healthy():
-                log.info("opencode serve already running — reusing")
-                self.available_engines.append("opencode")
-            else:
-                log.info("Starting opencode serve...")
-                log_path = os.path.join(_SERVER_DIR, "opencode_serve.log")
-                lf = open(log_path, "w")
-                self.opencode_proc = await asyncio.create_subprocess_exec(
-                    "opencode",
-                    "serve",
-                    "--port",
-                    str(OPENCODE_PORT),
-                    stdout=lf,
-                    stderr=lf,
-                )
-                # Wait up to 5 s for it to become healthy
-                for _ in range(10):
-                    await asyncio.sleep(0.5)
-                    if await _opencode_healthy():
-                        log.info(
-                            f"opencode serve started (pid={self.opencode_proc.pid})"
-                        )
-                        self.available_engines.append("opencode")
-                        break
-                else:
-                    log.warning("opencode serve did not become healthy in time")
-        else:
-            log.info("opencode not installed — skipping")
-
-        if _check_claude_installed():
-            self.available_engines.append("claude")
-            log.info("claude_agent_sdk detected — claude engine available")
-        else:
-            log.info("claude CLI not found — claude engine unavailable")
-
-        log.info(f"Available engines: {self.available_engines}")
-
-    async def _spawn_agent_process(
-        self,
-        room: Room,
-        name: str,
-        model_id: str,
-        engine: str = "opencode",
-        owner_name: str = "",
-    ) -> bool:
-        """Spawn a bridge.py subprocess and track it. Returns True on success.
-
-        【中文說明】組裝 bridge.py 的 CLI 命令列並啟動子程序：
-        - opencode 引擎：需同時傳遞 --opencode-model 和 --model（兩者值相同）
-        - claude 引擎：model_id 格式為 "claude/<model-name>"，需去掉前綴後傳給 --model
-        子程序的 stdout/stderr 均導向以 agent 名稱命名的 log 檔。
-        """
-        bridge_path = os.path.join(_SERVER_DIR, "bridge.py")
-        log_path = os.path.join(_SERVER_DIR, f"agent_{name}.log")
-
-        cmd = [
-            sys.executable,
-            bridge_path,
-            "--room",
-            room.room_id,
-            "--name",
-            name,
-            "--engine",
-            engine,
-        ]
-        if engine == "opencode":
-            # opencode 引擎需要同時指定 --opencode-model 與 --model
-            cmd += ["--opencode-model", model_id, "--model", model_id]
-        else:
-            # claude engine: model_id is "claude/<model-name>", extract the model name
-            # claude 引擎的 model_id 帶有 "claude/" 前綴，取 "/" 後的部分傳給 --model
-            claude_model = model_id.split("/", 1)[-1] if "/" in model_id else model_id
-            cmd += ["--model", claude_model]
-        if owner_name:
-            cmd += ["--owner-name", owner_name]
-
-        try:
-            log_file = open(log_path, "w")
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=log_file,
-                stderr=log_file,
-                cwd=_SERVER_DIR,
-            )
-            self.spawned_procs.append(proc)
-            log.info(
-                f"Spawned agent '{name}' ({engine}/{model_id}) | pid={proc.pid} | room={room.room_id}"
-            )
-            return True
-        except Exception as e:
-            log.error(f"Failed to spawn agent '{name}': {e}")
-            return False
+        log.info("RoomServer started (pure WebSocket hub mode)")
 
     async def shutdown(self):
-        """Terminate all spawned agent and opencode serve processes.
+        """Server shutdown — close all rooms.
 
-        【中文說明】伺服器關閉時，終止所有由 _spawn_agent_process() 產生的 bridge 子程序，
-        以及若由本伺服器自行啟動的 opencode serve 子程序（returncode 仍為 None 表示尚在執行）。
+        【中文說明】Server 關閉時只需要清理 room 狀態。
+        Bridge 子進程的清理由各個 TUI client 自行負責。
         """
-        all_procs = self.spawned_procs[:]
-        if self.opencode_proc and self.opencode_proc.returncode is None:
-            all_procs.append(self.opencode_proc)
-        for proc in all_procs:
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-        self.spawned_procs.clear()
+        log.info("RoomServer shutting down")
 
     def get_or_create_room(self, room_id: str) -> Room:
         """惰性初始化（lazy initialization）：首次存取時建立 Room，後續重複使用同一物件。
@@ -660,8 +514,9 @@ class RoomServer:
                     f"Observer joined | room={room_id} | name={name} | owner={is_owner}"
                 )
 
-                # 發送 joined 確認，附帶當前房間狀態快照、歷史記錄及可用引擎清單
+                # 發送 joined 確認，附帶當前房間狀態快照與歷史記錄
                 # 注意：owner_name 會傳給所有 observer，讓大家都能看到 room header
+                # available_engines 已移至 TUI 端自行偵測，不再由 server 提供
                 owner_name_for_all = ""
                 # 找出其他 observer 中是否有 owner，傳遞給新加入的 observer
                 if is_owner:
@@ -683,7 +538,6 @@ class RoomServer:
                             "owner_name": owner_name_for_all,
                             "room_state": room.room_state_payload(),
                             "history": room.context_window(),
-                            "available_engines": self.available_engines,
                         }
                     )
                 )
@@ -698,45 +552,6 @@ class RoomServer:
                     except Exception:
                         continue
                     msg_type = owner_msg.get("type")
-
-                    # ── spawn_agent: server spawns a bridge subprocess ────────
-                    # 由 owner 請求伺服器在本機啟動一個 bridge.py agent 子程序
-                    if msg_type == "spawn_agent":
-                        agent_name = owner_msg.get(
-                            "name", "agent"
-                        )  # different var from observer name
-                        model_id = owner_msg.get("model", "")
-                        engine = owner_msg.get("engine", "opencode")
-                        # 檢查所要求的引擎是否在本伺服器上可用
-                        if engine not in self.available_engines:
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "spawn_result",
-                                        "name": agent_name,
-                                        "model": model_id,
-                                        "success": False,
-                                        "reason": f"engine '{engine}' not available on this server",
-                                    }
-                                )
-                            )
-                            continue
-                        ok = await self._spawn_agent_process(
-                            room, agent_name, model_id, engine, owner_name=name
-                        )
-                        # 回報 spawn 結果給 owner
-                        await ws.send(
-                            json.dumps(
-                                {
-                                    "type": "spawn_result",
-                                    "name": agent_name,
-                                    "model": model_id,
-                                    "engine": engine,
-                                    "success": ok,
-                                }
-                            )
-                        )
-                        continue
 
                     # ── kick_all: owner removes every agent from the room ─────
                     # owner 將房間內所有 agent 一次全部踢除
@@ -1329,12 +1144,12 @@ async def main():
             ping_interval=60,  # 每 60 秒發送一次 WebSocket ping，保持長連線不被 NAT/防火牆切斷
             ping_timeout=300,  # 等待 pong 回應最多 300 秒，適應 agent 長時間計算的情境
         ):
-            log.info(f"Server ready. Engines: {server.available_engines}")
+            log.info("Server ready. Waiting for connections (agents spawn from TUI).")
             # asyncio.Future() 永遠不會 resolve，讓伺服器持續運行直到收到 Ctrl-C 中斷信號
             await asyncio.Future()
     finally:
         await server.shutdown()
-        log.info("All spawned agents terminated.")
+        log.info("Server shutdown complete.")
 
 
 if __name__ == "__main__":

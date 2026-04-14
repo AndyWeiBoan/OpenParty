@@ -29,6 +29,8 @@ OpenParty TUI — 基於 Textual 框架的多 Agent 討論室客戶端
 """
 
 import asyncio
+import atexit
+import importlib.util
 import json
 import argparse
 import fnmatch
@@ -36,7 +38,9 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import uuid as uuid_mod
 from datetime import datetime
 from pathlib import Path
@@ -97,6 +101,93 @@ GREEN_STYLE = Style(color="green")  # 成功/加入通知：綠色
 RED_STYLE = Style(color="red")  # 錯誤/離開通知：紅色
 YELLOW_STYLE = Style(color="yellow")  # 警告/系統訊息：黃色
 CYAN_STYLE = Style(color="cyan")  # 一般提示：青色
+
+# TUI 腳本所在目錄，用於定位 bridge.py
+_TUI_DIR = os.path.dirname(os.path.abspath(__file__))
+# opencode serve 預設 port（健康檢查使用）
+OPENCODE_PORT = 4096
+
+
+# ── Spawn agent 輔助函式（module-level，方便單元測試）──────────────────────────
+
+
+def _build_bridge_cmd(
+    name: str,
+    model_id: str,
+    engine: str,
+    server_url: str,
+    room: str,
+) -> list[str]:
+    """組裝啟動 bridge.py 的 CLI 命令列表。
+
+    Args:
+        name       : Agent 顯示名稱
+        model_id   : 完整 model ID（opencode 格式如 "provider/model"；
+                     claude 格式如 "claude/claude-sonnet-4-6"）
+        engine     : "opencode" 或 "claude"
+        server_url : TUI 連回的 WebSocket server URL（如 ws://localhost:8765）
+        room       : 房間 ID
+
+    Returns:
+        可直接傳給 asyncio.create_subprocess_exec(*cmd) 的命令列表
+    """
+    bridge_path = os.path.join(_TUI_DIR, "bridge.py")
+    cmd = [
+        sys.executable,
+        bridge_path,
+        "--room",
+        room,
+        "--name",
+        name,
+        "--server",
+        server_url,
+        "--engine",
+        engine,
+    ]
+    if engine == "opencode":
+        # opencode 引擎需要同時指定 --opencode-model 與 --model
+        cmd += ["--opencode-model", model_id, "--model", model_id]
+    else:
+        # claude 引擎的 model_id 帶有 "claude/" 前綴，取 "/" 後的部分傳給 --model
+        claude_model = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+        cmd += ["--model", claude_model]
+    return cmd
+
+
+async def detect_available_engines() -> list[str]:
+    """即時偵測本機可用的 AI engine。
+
+    每次呼叫都重新偵測，不使用快取——避免環境變動（如 opencode serve 剛啟動）
+    導致誤判。
+
+    偵測邏輯：
+      opencode：shutil.which("opencode") 確認已安裝，再發 HTTP health check
+                確認 opencode serve 正在執行（需要 serve 才能使用）
+      claude  ：importlib.util.find_spec("claude_agent_sdk") 確認 SDK 已安裝
+
+    Returns:
+        可用 engine 名稱的列表，元素只能是 "opencode" 或 "claude"
+    """
+    engines: list[str] = []
+
+    # ── opencode：需要安裝 CLI 且 serve 正在執行 ──
+    if shutil.which("opencode") is not None:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"http://127.0.0.1:{OPENCODE_PORT}/global/health",
+                    timeout=aiohttp.ClientTimeout(total=2),
+                ) as r:
+                    if r.status == 200:
+                        engines.append("opencode")
+        except Exception:
+            pass  # serve 未啟動或連線失敗，視為不可用
+
+    # ── claude：只需 claude_agent_sdk 已安裝即可 ──
+    if importlib.util.find_spec("claude_agent_sdk") is not None:
+        engines.append("claude")
+
+    return engines
 
 
 # ── 輔助函式 ───────────────────────────────────────────────────────────────────
@@ -1803,9 +1894,10 @@ class OpenPartyApp(App):
         self.owner = owner  # 是否為房間擁有者
         self.ws = None  # WebSocket 連線物件（None = 尚未連線或已斷線）
         self.agents: list[dict] = []  # 目前在房間內的 Agent 列表
-        self.available_engines: list[
-            str
-        ] = []  # 伺服器回報可用的 engine 列表（如 ["claude", "opencode"]）
+        # TUI 自行維護可用 engine 清單，每次 /add-agent 時即時 health check，不依賴 server
+        self.available_engines: list[str] = []
+        # TUI 端 spawn 的 bridge 子進程列表，退出時統一清理
+        self.spawned_procs: list[asyncio.subprocess.Process] = []
         self._thinking: set[str] = set()  # 正在思考中的 Agent 名稱集合
         self._turn_complete: set[str] = (
             set()
@@ -1860,6 +1952,7 @@ class OpenPartyApp(App):
 
         啟動 WebSocket 連線任務（非同步，不阻塞 UI）。
         若為擁有者，聚焦輸入框以便立即輸入。
+        同時註冊 atexit 與 SIGINT handler，作為 Ctrl-C/異常退出時的 fallback 清理路徑。
         """
         print(
             f"[DEBUG] on_mount: owner={self.owner}, owner_name={self.owner_name}"
@@ -1871,16 +1964,46 @@ class OpenPartyApp(App):
             header.set_owner_info(self.owner_name)
         asyncio.create_task(self._run_ws())
 
+        # ── Fallback 清理：確保 bridge 子進程在異常退出時也能被終止 ──
+        # Textual 的 Ctrl-C 預設行為不一定走 on_unmount，故同時用 atexit + SIGINT
+        def _sync_cleanup():
+            for proc in self.spawned_procs:
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+
+        atexit.register(_sync_cleanup)
+
+        _orig_sigint = signal.getsignal(signal.SIGINT)
+
+        def _sigint_handler(signum, frame):
+            _sync_cleanup()
+            if callable(_orig_sigint):
+                _orig_sigint(signum, frame)
+
+        signal.signal(signal.SIGINT, _sigint_handler)
+
     def on_unmount(self) -> None:
         """App 卸載時的清理工作（使用者退出時呼叫）。
 
         刪除圖片暫存目錄，避免在 /tmp 留下殘留檔案。
+        同時終止所有由本 TUI spawn 的 bridge 子進程。
         """
         if os.path.isdir(self._image_save_dir):
             try:
                 shutil.rmtree(self._image_save_dir)
             except Exception:
                 pass
+        # 在 on_unmount 中同步清理子進程（asyncio loop 可能已停止，故用同步方式）
+        for proc in self.spawned_procs:
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        self.spawned_procs.clear()
 
     def _refresh_header(self) -> None:
         """更新 RoomHeader 顯示當前的 Agent 列表和討論主題。
@@ -1897,6 +2020,69 @@ class OpenPartyApp(App):
         )
         if self.owner and self.owner_name:
             header.set_owner_info(self.owner_name)
+
+    # ── Spawn agent process 管理 ──────────────────────────────────────────────
+
+    async def _spawn_agent_process(
+        self,
+        name: str,
+        model_id: str,
+        engine: str,
+    ) -> bool:
+        """在本機啟動 bridge.py 子進程，連回 server。
+
+        Args:
+            name     : Agent 顯示名稱
+            model_id : 完整 model ID（格式依 engine 而定）
+            engine   : "opencode" 或 "claude"
+
+        Returns:
+            True = spawn 成功；False = 發生錯誤（錯誤訊息已寫入 chat log）
+        """
+        log_path = os.path.join(_TUI_DIR, f"agent_{name}.log")
+        cmd = _build_bridge_cmd(
+            name=name,
+            model_id=model_id,
+            engine=engine,
+            server_url=self.server_url,
+            room=self.room_id,
+        )
+        try:
+            log_file = open(log_path, "w")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=log_file,
+                stderr=log_file,
+                cwd=_TUI_DIR,
+            )
+            self.spawned_procs.append(proc)
+            return True
+        except FileNotFoundError as e:
+            self._chat(
+                Text(
+                    f"  [spawn] 找不到 bridge.py 或直譯器：{e}",
+                    style=RED_STYLE,
+                )
+            )
+            return False
+        except Exception as e:
+            self._chat(
+                Text(
+                    f"  [spawn] 啟動 {name} 失敗：{e}",
+                    style=RED_STYLE,
+                )
+            )
+            return False
+
+    async def _cleanup_spawned_procs(self) -> None:
+        """終止所有由本 TUI spawn 的 bridge 子進程（已結束的跳過）。"""
+        for proc in list(self.spawned_procs):
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        self.spawned_procs.clear()
 
     # ── WebSocket 連線管理 ─────────────────────────────────────────────────────
 
@@ -2060,8 +2246,8 @@ class OpenPartyApp(App):
           turn_end         → Agent 完成回覆：停止 spinner、記錄延遲
           agent_thinking   → Agent 思考進度更新：更新標題列狀態摘要
           message          → 一般聊天訊息：格式化後顯示
-          spawn_result     → 啟動 Agent 結果通知：成功/失敗訊息
-          room_state       → 靜默忽略（目前無需處理）
+          room_state       → 更新 observers 列表與 owner 資訊
+          agent_joined     → spawn 成功確認信號（Phase 3 統一協議）
           其他             → dim 顯示原始 JSON（偵錯用）
         """
         msg = event.data
@@ -2069,7 +2255,7 @@ class OpenPartyApp(App):
 
         if t == "joined":
             # 初始化：伺服器確認加入成功，並回傳當前房間狀態
-            self.available_engines = msg.get("available_engines", [])
+            # available_engines 由 TUI 自行偵測，不再從 server 取得
             state = msg.get("room_state", {})
             topic = state.get("topic", "(waiting for owner to set topic)")
             participants = state.get("participants", [])
@@ -2198,19 +2384,6 @@ class OpenPartyApp(App):
         elif t == "message":
             # 一般聊天訊息：格式化後寫入聊天記錄
             self._print_message(msg)
-
-        elif t == "spawn_result":
-            # 啟動 Agent 結果：成功（綠色）或失敗（紅色）
-            name = msg.get("name", "?")
-            model = msg.get("model", "?")
-            if msg.get("success"):
-                self._chat(
-                    Text(
-                        f"{now()}  [server] 已啟動 {name} ({model})", style=GREEN_STYLE
-                    )
-                )
-            else:
-                self._chat(Text(f"{now()}  [server] 啟動 {name} 失敗", style=RED_STYLE))
 
         elif t == "room_state":
             # 更新 observers 列表（包含 owner 和其他 observer）
@@ -2461,13 +2634,14 @@ class OpenPartyApp(App):
             return
 
         if text == "/add-agent":
-            # 顯示讀取中提示（非同步操作前給使用者反饋）
-            self._chat(Text(f"{now()}  [system] 正在讀取可用模型...", style=DIM_STYLE))
+            # 每次執行時即時偵測可用 engine（不快取，避免環境變動誤判）
+            self._chat(Text(f"{now()}  [system] 正在偵測可用引擎與讀取模型...", style=DIM_STYLE))
+            self.available_engines = await detect_available_engines()
             models = await _fetch_models(self.available_engines)
             if not models:
                 self._chat(
                     Text(
-                        f"{now()}  [system] 沒有可用的 engine（server 未偵測到 opencode 或 claude）",
+                        f"{now()}  [system] 沒有可用的 engine（本機未偵測到 opencode serve 或 claude SDK）",
                         style=RED_STYLE,
                     )
                 )
@@ -2491,18 +2665,20 @@ class OpenPartyApp(App):
                     style=GREEN_STYLE,
                 )
             )
-            # 通知伺服器啟動新 Agent（伺服器負責實際啟動 bridge.py 子行程）
-            if self.ws is not None:
-                await self.ws.send(
-                    json.dumps(
-                        {
-                            "type": "spawn_agent",
-                            "name": agent_name,
-                            "model": chosen["full_id"],
-                            "engine": chosen.get("engine", "opencode"),
-                        }
+            # 直接在本地 spawn bridge.py 子進程，不再透過 server 的 spawn_agent WS 訊息
+            ok = await self._spawn_agent_process(
+                name=agent_name,
+                model_id=chosen["full_id"],
+                engine=chosen.get("engine", "opencode"),
+            )
+            if not ok:
+                self._chat(
+                    Text(
+                        f"{now()}  [spawn] 啟動 '{agent_name}' 失敗，請檢查 agent_{agent_name}.log",
+                        style=RED_STYLE,
                     )
                 )
+            # spawn 成功後，確認信號來自 server 廣播的 agent_joined（participant_joined）事件
             return
 
         if text == "/kick-all":
